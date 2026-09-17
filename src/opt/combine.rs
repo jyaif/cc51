@@ -357,14 +357,18 @@ fn simplify_inst(f: &Func, inf: &Info, ins: &Inst) -> Option<Inst> {
     }
 }
 
+/// Largest value of a signed type of this width.
+fn signed_max(ty: Ty) -> i64 {
+    if ty.bits() >= 64 { i64::MAX } else { (1i64 << (ty.bits() - 1)) - 1 }
+}
+
 /// Compare against a constant that makes the result trivially known.
 fn trivial_cmp(c: Cond, b: Val, ty: Ty) -> Option<bool> {
     let Val::K(k) = b else { return None };
     let u = ty.norm(k) as u64;
     let max = ty.mask();
     let s = ty.sext(k);
-    let smin = -(1i64 << (ty.bits() - 1));
-    let smax = (1i64 << (ty.bits() - 1)) - 1;
+    let (smin, smax) = if ty.bits() >= 64 { (i64::MIN, i64::MAX) } else { (-(1i64 << (ty.bits() - 1)), (1i64 << (ty.bits() - 1)) - 1) };
     match c {
         Cond::GeU if u == 0 => Some(true),
         Cond::LtU if u == 0 => Some(false),
@@ -753,8 +757,8 @@ fn fuse_branches(f: &mut Func) -> bool {
                     match (c, b) {
                         (Cond::LeU, Val::K(k)) if (ty.norm(*k) as u64) < ty.mask() => Some(Term::CmpBr(Cond::LtU, *a, Val::K(ty.norm(k + 1)), *ty, *t, *e)),
                         (Cond::GtU, Val::K(k)) if (ty.norm(*k) as u64) < ty.mask() => Some(Term::CmpBr(Cond::GeU, *a, Val::K(ty.norm(k + 1)), *ty, *t, *e)),
-                        (Cond::LeS, Val::K(k)) if ty.sext(*k) < (1i64 << (ty.bits() - 1)) - 1 => Some(Term::CmpBr(Cond::LtS, *a, Val::K(ty.norm(k + 1)), *ty, *t, *e)),
-                        (Cond::GtS, Val::K(k)) if ty.sext(*k) < (1i64 << (ty.bits() - 1)) - 1 => Some(Term::CmpBr(Cond::GeS, *a, Val::K(ty.norm(k + 1)), *ty, *t, *e)),
+                        (Cond::LeS, Val::K(k)) if ty.sext(*k) < signed_max(*ty) => Some(Term::CmpBr(Cond::LtS, *a, Val::K(ty.norm(k + 1)), *ty, *t, *e)),
+                        (Cond::GtS, Val::K(k)) if ty.sext(*k) < signed_max(*ty) => Some(Term::CmpBr(Cond::GeS, *a, Val::K(ty.norm(k + 1)), *ty, *t, *e)),
                         _ => None,
                     }
                 }

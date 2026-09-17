@@ -1633,12 +1633,17 @@ impl<'a> Gen<'a> {
                 // Sequential bytes through @Ri (the pointer register must not be a destination).
                 let busy_extra: Vec<Val> = vec![Val::R(d)];
                 let dest_ptr = [1u8, 0].into_iter().find(|r| dl.contains(&Loc::R(*r)));
-                let r = match (m, dest_ptr) {
-                    (Mem::Sym(sy, so), Some(r)) if self.pick_ptr_reg(self.busy_regs(&busy_extra)).is_none() => {
-                        // Point with a destination register (its byte is held in B).
-                        let e = self.addr_expr(sy, *so);
-                        self.set_reg_imm(r, e);
-                        self.scratch |= 1 << r;
+                let r = match dest_ptr {
+                    // No pointer register is free: point with a destination register (its byte is held in B).
+                    Some(r) if self.pick_ptr_reg(self.busy_regs(&busy_extra)).is_none() => {
+                        match m {
+                            Mem::Sym(sy, so) => {
+                                let e = self.addr_expr(sy, *so);
+                                self.set_reg_imm(r, e);
+                                self.scratch |= 1 << r;
+                            }
+                            _ => self.set_rptr_forced(m, r),
+                        }
                         r
                     }
                     _ => self.set_rptr(m, 0, &busy_extra),

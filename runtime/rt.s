@@ -386,3 +386,47 @@ __abs_args32_b:
 	mov	r0,a
 __abs_args32_ret:
 	ret
+
+;;; module setjmp
+; int setjmp(jmp_buf env): saves SP and the return address; returns 0.
+_setjmp:
+	mov	r0,ar7
+	mov	a,sp
+	mov	@r0,a
+	add	a,#0xff
+	mov	r1,a
+	inc	r0
+	mov	a,@r1
+	mov	@r0,a
+	inc	r0
+	inc	r1
+	mov	a,@r1
+	mov	@r0,a
+	mov	r7,#0
+	mov	r6,#0
+	ret
+; void longjmp(jmp_buf env, int val): resumes at the matching setjmp, which returns val (or 1).
+_longjmp:
+	mov	r0,ar7
+	mov	b,ie
+	clr	ea
+	mov	a,@r0
+	add	a,#0xfe
+	mov	sp,a
+	inc	r0
+	mov	a,@r0
+	push	acc
+	inc	r0
+	mov	a,@r0
+	push	acc
+	mov	a,r3
+	mov	r7,a
+	mov	a,r2
+	mov	r6,a
+	orl	a,r7
+	jnz	_longjmp_ret
+	mov	r7,#1
+	mov	r6,#0
+_longjmp_ret:
+	mov	ie,b
+	ret

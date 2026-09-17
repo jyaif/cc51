@@ -182,6 +182,25 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
         let f = build_func(prog, fid).map_err(|e| e.to_string())?;
         funcs.push(Some(f));
     }
+    // Volatile locals live in frame objects; mark them so the optimizer keeps their accesses.
+    let mark_volatile = |funcs: &Vec<Option<Func>>| {
+        let mut vol: HashSet<Sym> = prog
+            .globals
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.volatile || matches!(g.space, Space::Sfr | Space::Sbit))
+            .map(|(i, _)| Sym::Global(i))
+            .collect();
+        for f in funcs.iter().flatten() {
+            for (i, o) in f.frame.iter().enumerate() {
+                if o.volatile {
+                    vol.insert(Sym::Frame(f.id, i as u32));
+                }
+            }
+        }
+        ir::set_volatile_syms(vol);
+    };
+    mark_volatile(&funcs);
 
     // Symbol resolution for inline assembly (per translation unit).
     let asm_resolver = |tu: usize, name: &str| -> Option<SymRes> {
@@ -374,6 +393,11 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
         let keep = |f: usize| roots.contains(&f) || prog.funcs[f].addr_taken;
         let is_inline = |f: usize| prog.funcs[f].is_inline;
         crate::opt::inline::run(&mut funcs, &order, &keep, &is_inline, &|f: &mut Func| crate::opt::optimize_func(f, &ocx));
+        // Inlining moves frame objects into the caller.
+        mark_volatile(&funcs);
+        for f in funcs.iter_mut().flatten() {
+            crate::opt::optimize_func(f, &ocx);
+        }
     }
     let (reach_f, reach_g, mut runtime_used) = compute_reach(&funcs);
     // Direct references to undefined functions are errors.
@@ -556,6 +580,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
             summaries[fid] = Some(Summary { params: p, ret: r, clobbers: ALL_REGS, keeps_b: false, keeps_dptr: false });
         }
     }
+    let rt_label_set: HashSet<Rc<str>> = runtime_modules().iter().flat_map(|m| m.labels.iter().map(|l| Rc::from(l.as_str()))).collect();
     let mut codes: Vec<(usize, Vec<Item>)> = Vec::new();
     let (mut iargs_bytes, mut iargs_bits) = (0u32, 0u16);
     let mut frames: Vec<FrameReq> = vec![FrameReq::default(); n];
@@ -577,6 +602,10 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
         let callee_summary = |c: &Callee| -> Summary {
             match c {
                 Callee::Direct(x) => summaries[*x].clone().unwrap_or_else(|| {
+                    // Provided by the runtime library: helper convention.
+                    if rt_label_set.contains(&*fnames[*x]) {
+                        return helper_summary(&fnames[*x]);
+                    }
                     // Undefined (runtime/asm) function: assume SDCC convention.
                     let (p, r) = (vec![], vec![ACC]);
                     Summary { params: p, ret: r, clobbers: ALL_REGS, keeps_b: false, keeps_dptr: false }
@@ -904,6 +933,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     }
     // Runtime scratch RAM.
     let rt_mods = runtime_modules();
+    let rt_labels: HashSet<&str> = rt_mods.iter().flat_map(|m| m.labels.iter().map(|l| l.as_str())).collect();
     let mut rt_needed: Vec<usize> = Vec::new();
     {
         // Implied helpers from IR.
@@ -941,7 +971,9 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
                 if let Item::Insn(i) = it {
                     if let Some(t) = i.target() {
                         if let Some(s) = &t.sym {
-                            if s.starts_with("__") && !s.starts_with("__s") && !s.starts_with("__o") && !s.starts_with("__b") {
+                            // Frame slots and objects (__s<f>_<n>, __b<f>_<n>, __o<f>_<n>) are not runtime symbols.
+                            let is_frame_sym = matches!(s.as_bytes().get(2), Some(b's') | Some(b'b') | Some(b'o')) && s.as_bytes().get(3).map_or(false, |c| c.is_ascii_digit());
+                            if (s.starts_with("__") && !is_frame_sym) || rt_labels.contains(&**s) {
                                 runtime_used.insert(s.to_string());
                             }
                         }

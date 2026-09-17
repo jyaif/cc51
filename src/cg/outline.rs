@@ -29,7 +29,8 @@ fn movable(i: &Insn, globals: &HashSet<Rc<str>>) -> bool {
             }
             is_global_target(i, globals)
         }
-        Mn::Call => is_global_target(i, globals),
+        // A setjmp call must not move: it records the stack depth of its caller.
+        Mn::Call => is_global_target(i, globals) && !matches!(i.target(), Some(Expr { sym: Some(s), .. }) if &**s == "_setjmp"),
         Mn::Ret => true,
         m if m.is_cond_jump() => false,
         Mn::Sjmp | Mn::Ajmp | Mn::Ljmp | Mn::Acall | Mn::Lcall => false,

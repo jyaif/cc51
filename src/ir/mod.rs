@@ -520,6 +520,8 @@ pub struct FrameObj {
     pub name: Rc<str>,
     /// Holds the incoming value of this parameter index (aggregate or address-taken parameter).
     pub param: Option<usize>,
+    /// Declared volatile: loads and stores must be kept.
+    pub volatile: bool,
 }
 
 /// How a parameter is received.

@@ -146,7 +146,7 @@ pub fn build_func(prog: &Program, fid: FuncId) -> Result<Func> {
         if param_in_memory(prog, af, i) {
             let size = prog.size(&l.ty);
             let idx = b.f.frame.len() as u32;
-            b.f.frame.push(FrameObj { size, space: Space::Data, name: l.name.clone(), param: Some(i) });
+            b.f.frame.push(FrameObj { size, space: Space::Data, name: l.name.clone(), param: Some(i), volatile: false });
             b.locals.insert(lid, Storage::Frame(idx));
             b.f.params.push(ParamLoc::Frame(idx));
         } else {
@@ -156,7 +156,7 @@ pub fn build_func(prog: &Program, fid: FuncId) -> Result<Func> {
             if l.addr_taken {
                 // Received in a register, then kept in memory.
                 let idx = b.f.frame.len() as u32;
-                b.f.frame.push(FrameObj { size: prog.size(&l.ty), space: Space::Data, name: l.name.clone(), param: None });
+                b.f.frame.push(FrameObj { size: prog.size(&l.ty), space: Space::Data, name: l.name.clone(), param: None, volatile: l.ty.q.is_volatile });
                 b.locals.insert(lid, Storage::Frame(idx));
                 let sty = if ty == Ty::Bit { Ty::I8 } else { ty };
                 let sv = if ty == Ty::Bit { b.resize(Val::R(v), Ty::Bit, Ty::I8, false) } else { Val::R(v) };
@@ -169,13 +169,13 @@ pub fn build_func(prog: &Program, fid: FuncId) -> Result<Func> {
     if ft.ret.is_record() {
         let size = prog.size(&ft.ret);
         let idx = b.f.frame.len() as u32;
-        b.f.frame.push(FrameObj { size, space: Space::Data, name: "__retval".into(), param: None });
+        b.f.frame.push(FrameObj { size, space: Space::Data, name: "__retval".into(), param: None, volatile: false });
         b.f.ret_obj = Some(idx);
     }
     if ft.variadic {
         let idx = b.f.frame.len() as u32;
         debug_assert_eq!(idx, varargs_obj_index(prog, fid));
-        b.f.frame.push(FrameObj { size: vararg_size(fid).max(1), space: Space::Data, name: "__varargs".into(), param: None });
+        b.f.frame.push(FrameObj { size: vararg_size(fid).max(1), space: Space::Data, name: "__varargs".into(), param: None, volatile: false });
     }
     let body = af.body.as_ref().unwrap();
     if ft.attrs.critical {
@@ -250,7 +250,8 @@ impl<'a> Builder<'a> {
             return *s;
         }
         let l = &self.prog.funcs[self.fid].locals[lid];
-        let s = if l.ty.is_scalar() && !l.addr_taken && l.space.is_none() {
+        // A volatile local must live in memory so that every access is performed.
+        let s = if l.ty.is_scalar() && !l.addr_taken && l.space.is_none() && !l.ty.q.is_volatile {
             let v = self.f.new_vreg(ir_ty(self.prog, &l.ty));
             self.f.vregs[v as usize].name = Some(l.name.clone());
             Storage::Reg(v)
@@ -262,7 +263,7 @@ impl<'a> Builder<'a> {
                 Some(Space::Xdata) => Space::Xdata,
                 _ => Space::Data,
             };
-            self.f.frame.push(FrameObj { size, space, name: l.name.clone(), param: None });
+            self.f.frame.push(FrameObj { size, space, name: l.name.clone(), param: None, volatile: l.ty.q.is_volatile });
             Storage::Frame(idx)
         };
         self.locals.insert(lid, s);
@@ -369,7 +370,7 @@ impl<'a> Builder<'a> {
                 // Copy the selected aggregate into a temporary frame object.
                 let size = self.prog.size(&e.ty);
                 let idx = self.f.frame.len() as u32;
-                self.f.frame.push(FrameObj { size, space: Space::Data, name: "__condtmp".into(), param: None });
+                self.f.frame.push(FrameObj { size, space: Space::Data, name: "__condtmp".into(), param: None, volatile: false });
                 let dst = Mem::Sym(Sym::Frame(self.fid, idx), 0);
                 let (tb, fb, join) = (self.f.new_block(), self.f.new_block(), self.f.new_block());
                 self.cond_branch(c, tb, fb)?;
@@ -1210,6 +1211,23 @@ impl<'a> Builder<'a> {
             return Ok(Val::R(r));
         }
         let signed = ty.is_signed();
+        // 64-bit multiply and divide are library functions (too wide for the register convention).
+        if t == Ty::I64 {
+            let name = match (op, signed) {
+                (BinOp::Mul, _) => Some("__mullonglong"),
+                (BinOp::Div, true) => Some("__divslonglong"),
+                (BinOp::Div, false) => Some("__divulonglong"),
+                (BinOp::Mod, true) => Some("__modslonglong"),
+                (BinOp::Mod, false) => Some("__modulonglong"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                let r = self.tmp(Ty::I64);
+                let c = self.lib_callee(name);
+                self.emit(Inst::Call(Some(r), c, vec![a, b]));
+                return Ok(Val::R(r));
+            }
+        }
         let k = match op {
             BinOp::Add => BinK::Add,
             BinOp::Sub => BinK::Sub,

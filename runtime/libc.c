@@ -1113,3 +1113,61 @@ int __signbitf(float x) {
   v.f = x;
   return (int)(v.u >> 31);
 }
+
+/* ---- 64-bit multiply and divide ---- */
+
+unsigned long long __mullonglong(unsigned long long a, unsigned long long b) {
+  unsigned long long r = 0;
+  while (b) {
+    if (b & 1) r += a;
+    a <<= 1;
+    b >>= 1;
+  }
+  return r;
+}
+
+static unsigned long long __udivmod64(unsigned long long a, unsigned long long b, unsigned long long *rem) {
+  unsigned long long q = 0, r = 0;
+  unsigned char i = 64;
+  if (!b) {
+    if (rem) *rem = 0;
+    return 0;
+  }
+  while (i--) {
+    r = (r << 1) | ((a >> 63) & 1);
+    a <<= 1;
+    q <<= 1;
+    if (r >= b) {
+      r -= b;
+      q |= 1;
+    }
+  }
+  if (rem) *rem = r;
+  return q;
+}
+
+unsigned long long __divulonglong(unsigned long long a, unsigned long long b) { return __udivmod64(a, b, 0); }
+
+unsigned long long __modulonglong(unsigned long long a, unsigned long long b) {
+  unsigned long long r;
+  __udivmod64(a, b, &r);
+  return r;
+}
+
+long long __divslonglong(long long a, long long b) {
+  char neg = 0;
+  unsigned long long q;
+  if (a < 0) { a = -a; neg = 1; }
+  if (b < 0) { b = -b; neg = !neg; }
+  q = __udivmod64((unsigned long long)a, (unsigned long long)b, 0);
+  return neg ? -(long long)q : (long long)q;
+}
+
+long long __modslonglong(long long a, long long b) {
+  char neg = 0;
+  unsigned long long r;
+  if (a < 0) { a = -a; neg = 1; }
+  if (b < 0) b = -b;
+  __udivmod64((unsigned long long)a, (unsigned long long)b, &r);
+  return neg ? -(long long)r : (long long)r;
+}
