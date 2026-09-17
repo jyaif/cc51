@@ -159,11 +159,57 @@ fn merge_blocks(f: &mut Func) -> bool {
     changed
 }
 
+/// Thread jumps into blocks that only test values known at the end of the predecessor.
+fn thread_known(f: &mut Func) -> bool {
+    let mut changed = false;
+    for p in 0..f.blocks.len() {
+        let Term::Jmp(h) = f.blocks[p].term else { continue };
+        let hb = &f.blocks[h as usize];
+        if !hb.insts.is_empty() || h as usize == p {
+            continue;
+        }
+        // Constant value of a vreg at the end of block p (last definition in p).
+        let known = |v: Val| -> Option<i64> {
+            match v {
+                Val::K(k) => Some(k),
+                Val::R(r) => {
+                    for ins in f.blocks[p].insts.iter().rev() {
+                        if ins.def() == Some(r) {
+                            return match ins {
+                                Inst::Copy(_, Val::K(k)) => Some(*k),
+                                _ => None,
+                            };
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        };
+        let target = match &hb.term {
+            Term::CmpBr(c, a, b, ty, t, e) => match (known(*a), known(*b)) {
+                (Some(x), Some(y)) => Some(if c.eval(x, y, *ty) { *t } else { *e }),
+                _ => None,
+            },
+            Term::Br(v, t, e) => known(*v).map(|x| if x != 0 { *t } else { *e }),
+            _ => None,
+        };
+        if let Some(t) = target {
+            if t != h {
+                f.blocks[p].term = Term::Jmp(t);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 pub fn simplify(f: &mut Func) -> bool {
     let mut changed = false;
     loop {
         let mut c = fold_terms(f);
         c |= thread_jumps(f);
+        c |= thread_known(f);
         c |= remove_unreachable(f);
         c |= merge_blocks(f);
         if !c {

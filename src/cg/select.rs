@@ -3311,7 +3311,8 @@ impl<'a> Gen<'a> {
                 Term::Unreachable => {}
             }
         }
-        let clobbers = self.scratch | self.al.used_regs;
+        // Only registers actually written count as clobbered (parameters that are only read survive).
+        let clobbers = self.scratch;
         FnCode { items: self.items, clobbers, uses_b: self.uses_b, uses_dptr: self.uses_dptr }
     }
 }

@@ -67,7 +67,17 @@ fn loop_depths(f: &Func) -> Vec<u32> {
 /// Clobber sets of instructions that the code generator implements with helpers or scratch registers.
 pub fn inst_clobbers(f: &Func, ins: &Inst, callee: &dyn Fn(&Callee) -> Summary) -> RegSet {
     match ins {
-        Inst::Call(_, c, _) => callee(c).clobbers,
+        Inst::Call(_, c, _) => {
+            // The caller writes the callee's parameter registers.
+            let s = callee(c);
+            let mut m = s.clobbers;
+            for l in s.params.iter().flatten().chain(s.ret.iter()) {
+                if let Loc::R(r) = l {
+                    m |= 1 << r;
+                }
+            }
+            m
+        }
         Inst::Asm(_) => ALL_REGS,
         Inst::MemCopy(..) | Inst::MemSet(..) => 0x03,
         Inst::Bin(op, d, _, b) => {
