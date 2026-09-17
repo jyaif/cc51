@@ -332,3 +332,157 @@ int puts(const char *s) {
   putchar('\n');
   return 0;
 }
+
+/* ---- IEEE-754 single precision soft float (floats are passed as unsigned long bit patterns) ---- */
+
+#define __FS_SIGN 0x80000000UL
+#define __FS_MANT 0x00ffffffUL
+
+/* Pack sign, unbiased exponent and a mantissa normalized to bit 26 (3 guard bits). */
+static unsigned long __fs_pack(unsigned long sign, int exp, unsigned long m) {
+  if (!m) return sign;
+  while (m >= 0x8000000UL) {
+    m = (m >> 1) | (m & 1);
+    exp++;
+  }
+  while (m < 0x4000000UL) {
+    m <<= 1;
+    exp--;
+  }
+  /* round to nearest (guard bits: 3) */
+  m += 4;
+  if (m >= 0x8000000UL) {
+    m >>= 1;
+    exp++;
+  }
+  m >>= 3;
+  exp += 127;
+  if (exp >= 255) return sign | 0x7f800000UL;
+  if (exp <= 0) return sign;
+  return sign | ((unsigned long)exp << 23) | (m & 0x7fffffUL);
+}
+
+static int __fs_exp(unsigned long x) { return (int)((x >> 23) & 0xff) - 127; }
+
+static unsigned long __fs_mant(unsigned long x) { return ((x & 0x7fffffUL) | 0x800000UL) << 3; }
+
+unsigned long __fsadd(unsigned long a, unsigned long b) {
+  if (!(a & 0x7fffffffUL)) return b;
+  if (!(b & 0x7fffffffUL)) return a;
+  int ea = __fs_exp(a), eb = __fs_exp(b);
+  unsigned long ma = __fs_mant(a), mb = __fs_mant(b);
+  /* make |a| >= |b| */
+  if (eb > ea || (eb == ea && mb > ma)) {
+    unsigned long t = a;
+    a = b;
+    b = t;
+    int te = ea;
+    ea = eb;
+    eb = te;
+    t = ma;
+    ma = mb;
+    mb = t;
+  }
+  int d = ea - eb;
+  if (d > 30) {
+    mb = mb ? 1 : 0;
+  } else {
+    unsigned long lost = mb & ((1UL << d) - 1);
+    mb >>= d;
+    if (lost) mb |= 1;
+  }
+  if ((a ^ b) & __FS_SIGN)
+    ma -= mb;
+  else
+    ma += mb;
+  return __fs_pack(a & __FS_SIGN, ea, ma);
+}
+
+unsigned long __fssub(unsigned long a, unsigned long b) { return __fsadd(a, b ^ __FS_SIGN); }
+
+unsigned long __fsmul(unsigned long a, unsigned long b) {
+  unsigned long sign = (a ^ b) & __FS_SIGN;
+  if (!(a & 0x7fffffffUL) || !(b & 0x7fffffffUL)) return sign;
+  unsigned long ma = (a & 0x7fffffUL) | 0x800000UL;
+  unsigned long mb = (b & 0x7fffffUL) | 0x800000UL;
+  /* 24x24 bit product in two halves */
+  unsigned long ah = ma >> 12, al = ma & 0xfff, bh = mb >> 12, bl = mb & 0xfff;
+  unsigned long lo = al * bl;
+  unsigned long mid = ah * bl + al * bh + (lo >> 12);
+  unsigned long hi = ah * bh + (mid >> 12);
+  /* hi = product >> 24; keep sticky information from the lower part */
+  unsigned long m = (hi << 3) | (((mid & 0xfff) | (lo & 0xfff)) ? 1 : 0);
+  return __fs_pack(sign, __fs_exp(a) + __fs_exp(b) + 1 - 1, m << 1);
+}
+
+unsigned long __fsdiv(unsigned long a, unsigned long b) {
+  unsigned long sign = (a ^ b) & __FS_SIGN;
+  if (!(b & 0x7fffffffUL)) return sign | 0x7f800000UL;
+  if (!(a & 0x7fffffffUL)) return sign;
+  unsigned long ma = (a & 0x7fffffUL) | 0x800000UL;
+  unsigned long mb = (b & 0x7fffffUL) | 0x800000UL;
+  unsigned long q = 0;
+  unsigned char i;
+  for (i = 0; i < 27; i++) {
+    q <<= 1;
+    if (ma >= mb) {
+      ma -= mb;
+      q |= 1;
+    }
+    ma <<= 1;
+  }
+  if (ma) q |= 1;
+  return __fs_pack(sign, __fs_exp(a) - __fs_exp(b), q);
+}
+
+unsigned long __sl2fs(long v) {
+  unsigned long sign = 0;
+  if (v < 0) {
+    sign = __FS_SIGN;
+    v = -v;
+  }
+  unsigned long m = (unsigned long)v;
+  if (!m) return 0;
+  int e = 26;
+  while (m >= 0x8000000UL) {
+    m = (m >> 1) | (m & 1);
+    e++;
+  }
+  return __fs_pack(sign, e, m);
+}
+
+unsigned long __ul2fs(unsigned long m) {
+  if (!m) return 0;
+  int e = 26;
+  while (m >= 0x8000000UL) {
+    m = (m >> 1) | (m & 1);
+    e++;
+  }
+  return __fs_pack(0, e, m);
+}
+
+unsigned long __fs2ul(unsigned long a) {
+  int e = __fs_exp(a);
+  if (e < 0 || (a & __FS_SIGN)) return 0;
+  unsigned long m = (a & 0x7fffffUL) | 0x800000UL;
+  if (e > 31) return 0xffffffffUL;
+  if (e >= 23) return m << (e - 23);
+  return m >> (23 - e);
+}
+
+long __fs2sl(unsigned long a) {
+  unsigned long v = __fs2ul(a & 0x7fffffffUL);
+  return (a & __FS_SIGN) ? -(long)v : (long)v;
+}
+
+char __fseq(unsigned long a, unsigned long b) { return a == b || !((a | b) & 0x7fffffffUL); }
+
+char __fslt(unsigned long a, unsigned long b) {
+  if (!((a | b) & 0x7fffffffUL)) return 0;
+  if ((a ^ b) & __FS_SIGN) return (a & __FS_SIGN) != 0;
+  char neg = (a & __FS_SIGN) != 0;
+  a &= 0x7fffffffUL;
+  b &= 0x7fffffffUL;
+  if (a == b) return 0;
+  return (a < b) != neg;
+}

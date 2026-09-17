@@ -732,6 +732,9 @@ impl<'a> Gen<'a> {
         }
         let mut acc_holds: Option<Loc> = None;
         while !pending.is_empty() {
+            if acc_holds.is_some() && !pending.iter().any(|m| m.1 == Src::Acc) {
+                acc_holds = None;
+            }
             let is_src = |l: Loc, pending: &Vec<(Loc, Src)>, skip: usize| pending.iter().enumerate().any(|(i, m)| i != skip && m.1 == Src::L(l));
             if let Some(i) = (0..pending.len()).find(|&i| !is_src(pending[i].0, &pending, i)) {
                 let (d, s) = pending.remove(i);

@@ -215,6 +215,14 @@ impl<'a> Builder<'a> {
         self.cur = b;
         self.sealed = false;
     }
+    /// Callee for a library routine implemented in C (soft float).
+    fn lib_callee(&self, name: &'static str) -> Callee {
+        match self.prog.externs.get(name) {
+            Some(crate::ast::Sym::Func(fid)) if self.prog.funcs[*fid].body.is_some() => Callee::Direct(*fid),
+            _ => Callee::Runtime(name),
+        }
+    }
+
     fn tmp(&mut self, ty: Ty) -> VReg {
         self.f.new_vreg(ty)
     }
@@ -679,7 +687,8 @@ impl<'a> Builder<'a> {
             let v32 = self.resize(v, ft, Ty::I32, signed);
             let t = self.tmp(Ty::I32);
             let name = if signed { "__sl2fs" } else { "__ul2fs" };
-            self.emit(Inst::Call(Some(t), Callee::Runtime(name), vec![v32]));
+            let c = self.lib_callee(name);
+            self.emit(Inst::Call(Some(t), c, vec![v32]));
             return Ok(Val::R(t));
         }
         // float -> int
@@ -694,7 +703,8 @@ impl<'a> Builder<'a> {
         }
         let t = self.tmp(Ty::I32);
         let name = if to.is_signed() { "__fs2sl" } else { "__fs2ul" };
-        self.emit(Inst::Call(Some(t), Callee::Runtime(name), vec![v]));
+        let c = self.lib_callee(name);
+        self.emit(Inst::Call(Some(t), c, vec![v]));
         Ok(self.resize(Val::R(t), Ty::I32, tt, to.is_signed()))
     }
 
@@ -1010,7 +1020,8 @@ impl<'a> Builder<'a> {
         } else if l.ty.is_float() {
             let one = Val::K((d as f32).to_bits() as i64);
             let t = self.tmp(Ty::I32);
-            self.emit(Inst::Call(Some(t), Callee::Runtime("__fsadd"), vec![old, one]));
+            let c = self.lib_callee("__fsadd");
+            self.emit(Inst::Call(Some(t), c, vec![old, one]));
             Val::R(t)
         } else if l.ty.is_bool() {
             // bool++ sets to 1; bool-- toggles.
@@ -1091,7 +1102,8 @@ impl<'a> Builder<'a> {
             _ => unreachable!(),
         };
         let args = if swap { vec![b, a] } else { vec![a, b] };
-        self.emit(Inst::Call(Some(t), Callee::Runtime(name), args));
+        let c = self.lib_callee(name);
+        self.emit(Inst::Call(Some(t), c, args));
         let r = if matches!(op, BinOp::Ne | BinOp::Le | BinOp::Ge) {
             let n = self.tmp(Ty::I8);
             self.emit(Inst::Bin(BinK::Xor, n, Val::R(t), Val::K(1)));
@@ -1114,7 +1126,8 @@ impl<'a> Builder<'a> {
                 _ => return err(Loc::default(), "invalid floating point operation"),
             };
             let r = self.tmp(Ty::I32);
-            self.emit(Inst::Call(Some(r), Callee::Runtime(name), vec![a, b]));
+            let c = self.lib_callee(name);
+            self.emit(Inst::Call(Some(r), c, vec![a, b]));
             return Ok(Val::R(r));
         }
         let signed = ty.is_signed();

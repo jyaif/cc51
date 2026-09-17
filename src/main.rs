@@ -300,6 +300,9 @@ fn main() {
     }
     let mut prog = ast::Program::new();
     let mut tus: Vec<Vec<pp::PTok>> = Vec::new();
+    // Library members are weak (like archive members, only used when not already defined).
+    let mut tu_weak: Vec<bool> = Vec::new();
+    let mut seen_libs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut inputs = a.files.clone();
     for l in &a.libs {
         let names = [l.clone(), format!("{}.lib", l), format!("lib{}.lib", l)];
@@ -321,15 +324,21 @@ fn main() {
         let data = std::fs::read(path).unwrap_or_else(|e| fail(format!("cannot read {}: {}", f, e)));
         if data.starts_with(OBJ_MAGIC.as_bytes()) {
             // Object file or library (concatenated objects).
+            let is_lib = f.ends_with(".lib") || f.ends_with(".a");
+            if is_lib && !seen_libs.insert(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())) {
+                continue;
+            }
             let text = String::from_utf8_lossy(&data).into_owned();
             for part in text.split(OBJ_MAGIC).filter(|p| !p.trim().is_empty()) {
                 let mut pp = pp::Preprocessor::new(vec![], headers::get);
                 pp.line_markers = true;
                 tus.push(pp.preprocess_source(part, path).unwrap_or_else(|e| fail(e)));
+                tu_weak.push(is_lib);
             }
             continue;
         }
         let toks = preprocess(&a, path).unwrap_or_else(|e| fail(e));
+        tu_weak.push(false);
         tus.push(toks);
     }
     // Parse everything. If pointer address-space inference finds generic (3-byte) pointers, parse again
@@ -348,8 +357,12 @@ fn main() {
     for _ in 0..4 {
         prog = ast::Program::new();
         prog.spaces.generic_hint = hint.clone();
-        for t in &converted {
+        // Strong units first, then library members.
+        for (t, _) in converted.iter().zip(&tu_weak).filter(|(_, w)| !**w) {
             parse::parse_tu(t.clone(), &mut prog).unwrap_or_else(|e| fail(e));
+        }
+        for (t, _) in converted.iter().zip(&tu_weak).filter(|(_, w)| **w) {
+            parse::parse_tu_ex(t.clone(), &mut prog, true).unwrap_or_else(|e| fail(e));
         }
         parse::parse_tu_ex(libc_toks.clone(), &mut prog, true).unwrap_or_else(|e| fail(e));
         let n = prog.spaces.parent.len() as u32;

@@ -5,7 +5,7 @@ CC51=$(cd "$(dirname "$0")/.." && pwd)
 B=${TMPDIR:-/tmp}/minitel-builds
 mkdir -p $B
 printf "%-14s %-9s %8s %8s %7s\n" example model sdcc cc51 ratio
-for ex in hello_world image_gallery video_stream dino dino_game; do
+for ex in ${EXAMPLES:-hello_world video_stream dino dino_game}; do
   for model in nfz330 nfz400 722039m; do
     for tc in sdcc cc51; do
       d=$B/$ex-$model-$tc
