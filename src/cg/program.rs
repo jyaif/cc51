@@ -1014,7 +1014,11 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
     // Functions: main first, then the rest (the order is optimized below).
     let mut order_codes: Vec<(usize, Vec<Item>)> = codes;
     order_codes.sort_by_key(|(fid, _)| if *fid == main_fid { 0 } else { 1 });
+    let mut outline_ok: Vec<bool> = vec![false; nfixed];
     for (fid, items) in order_codes {
+        let f = funcs[fid].as_ref().unwrap();
+        let has_asm = f.blocks.iter().any(|b| b.insts.iter().any(|x| matches!(x, Inst::Asm(_))));
+        outline_ok.push(!has_asm && !f.attrs.naked);
         sections.push(Section { name: fnames[fid].clone(), items, org: None });
     }
     // Runtime modules.
@@ -1024,6 +1028,17 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         p.label_prefix = format!("__rt{}", mi);
         let items = p.parse(&rt_mods[mi].text).map_err(|e| format!("runtime: {}", e))?;
         sections.push(Section { name: format!("runtime{}", mi).into(), items, org: None });
+    }
+    // Procedural abstraction over functions and runtime code.
+    outline_ok.resize(sections.len(), false);
+    if opts.opt > 0 {
+        let mut globals: HashSet<Rc<str>> = fnames.iter().cloned().collect();
+        for m in &rt_mods {
+            for l in &m.labels {
+                globals.insert(l.as_str().into());
+            }
+        }
+        cg_outline(&mut sections, &outline_ok, &globals);
     }
     // Constant data in code space.
     for &g in &code_globals {
@@ -1085,6 +1100,10 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         let _ = writeln!(map, "  {:#04x} {}", v, k);
     }
     Ok(Output { image: lk.image, hex, listing: lk.listing, map, code_size, ram_used: lay.ram_end })
+}
+
+fn cg_outline(sections: &mut Vec<Section>, ok: &[bool], globals: &HashSet<Rc<str>>) {
+    super::outline::run(sections, ok, globals);
 }
 
 /// Search for a section order that minimizes code size.

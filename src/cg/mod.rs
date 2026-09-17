@@ -4,6 +4,7 @@ pub mod alloc;
 pub mod fold;
 pub mod select;
 pub mod layout;
+pub mod outline;
 pub mod peep;
 pub mod program;
 
