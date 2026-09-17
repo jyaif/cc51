@@ -108,6 +108,8 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
     let mut copy_pairs: Vec<(VReg, VReg)> = Vec::new();
     let depth = loop_depths(f);
     let mut ever_live = BitSet::new(n);
+    // Internal-RAM pointer dereferences: (base vreg, vregs live across or used by the instruction).
+    let mut ptr_sites: Vec<(Option<usize>, Vec<usize>)> = Vec::new();
 
     let add_interf = |interf: &mut Vec<BitSet>, a: usize, b: usize| {
         if a != b {
@@ -191,9 +193,19 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
                 copy_pairs.push((*dd, *s));
             }
             // Pointer bases.
+            let mut site_needed = false;
+            let mut site_base: Option<usize> = None;
             let mut mark_ptr = |m: &Mem| {
-                if let Mem::Ptr(Val::R(p), _, PSpace::S(Space::Data | Space::Idata)) = m {
-                    ptr_base[*p as usize] = true;
+                match m {
+                    Mem::Ptr(Val::R(p), _, PSpace::S(Space::Data | Space::Idata)) => {
+                        ptr_base[*p as usize] = true;
+                        site_needed = true;
+                        if !folded(*p) {
+                            site_base = Some(*p as usize);
+                        }
+                    }
+                    Mem::Ptr(_, _, PSpace::S(Space::Data | Space::Idata)) => site_needed = true,
+                    _ => {}
                 }
             };
             match ins {
@@ -204,6 +216,15 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
                 }
                 Inst::MemSet(a, _, _) => mark_ptr(a),
                 _ => {}
+            }
+            if site_needed {
+                let mut lv: Vec<usize> = l.iter().collect();
+                for u in ins.uses() {
+                    if !folded(u) && Some(u as usize) != site_base {
+                        lv.push(u as usize);
+                    }
+                }
+                ptr_sites.push((site_base, lv));
             }
             for u in ins.uses() {
                 weight[u as usize] += w;
@@ -299,6 +320,24 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
             let default: &[u8] = if ptr_base[v] && k == 0 { &[0, 1, 7, 6, 5, 4, 3, 2] } else { &[7, 6, 5, 4, 3, 2, 1, 0] };
             prefs.extend_from_slice(default);
             for r in prefs {
+                if r <= 1 && taken & (1 << r) == 0 {
+                    // Keep one of R0/R1 available at internal-RAM pointer dereferences.
+                    let other = 1 - r;
+                    let own_other = assigned.iter().any(|a| *a == Some(Loc::R(other)));
+                    let blocked = ptr_sites.iter().any(|(base, lv)| {
+                        if !lv.contains(&v) {
+                            return false;
+                        }
+                        let base_in_rptr = base.map_or(false, |b| b == v || locs[b].first().map_or(false, |l| matches!(l, Loc::R(0) | Loc::R(1))));
+                        if base_in_rptr {
+                            return false;
+                        }
+                        own_other || lv.iter().any(|&x| x != v && locs[x].iter().any(|l| *l == Loc::R(other)))
+                    });
+                    if blocked {
+                        continue;
+                    }
+                }
                 if taken & (1 << r) == 0 {
                     assigned[k] = Some(Loc::R(r));
                     taken |= 1 << r;

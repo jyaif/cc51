@@ -15,3 +15,7 @@ path = "src/main.rs"
 [[bin]]
 name = "sim51"
 path = "src/bin/sim51.rs"
+
+[[bin]]
+name = "minitel_sim"
+path = "src/bin/minitel_sim.rs"
