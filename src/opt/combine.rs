@@ -678,6 +678,45 @@ fn narrow(f: &mut Func) -> bool {
     changed
 }
 
+/// `c = copy x; ...; x = ...; d = load [c]` -> `c = copy x; d = load [x]; ...; x = ...`
+/// (typical of `*p++`), so that the copy dies.
+fn hoist_post_inc_loads(f: &mut Func) -> bool {
+    let inf = info(f);
+    for bi in 0..f.blocks.len() {
+        let n = f.blocks[bi].insts.len();
+        for j in 0..n {
+            let (d, c, off, sp) = match &f.blocks[bi].insts[j] {
+                Inst::Load(d, Mem::Ptr(Val::R(c), off, sp)) => (*d, *c, *off, *sp),
+                _ => continue,
+            };
+            if inf.nuses[c as usize] != 1 || inf.ndefs[d as usize] != 1 || inf.ndefs[c as usize] != 1 {
+                continue;
+            }
+            let (cb, ci) = inf.def_at[c as usize];
+            if cb as usize != bi || ci as usize >= j {
+                continue;
+            }
+            let Inst::Copy(_, Val::R(x)) = f.blocks[bi].insts[ci as usize] else { continue };
+            let pure_space = matches!(sp, PSpace::S(crate::types::Space::Code));
+            let between = &f.blocks[bi].insts[ci as usize + 1..j];
+            if !pure_space && between.iter().any(|i| i.has_side_effects()) {
+                continue;
+            }
+            if between.iter().any(|i| i.uses().contains(&d)) {
+                continue;
+            }
+            if !between.iter().any(|i| i.def() == Some(x)) {
+                continue;
+            }
+            let blk = &mut f.blocks[bi];
+            let _ = blk.insts.remove(j);
+            blk.insts.insert(ci as usize + 1, Inst::Load(d, Mem::Ptr(Val::R(x), off, sp)));
+            return true;
+        }
+    }
+    false
+}
+
 /// Fuse comparisons into branches.
 fn fuse_branches(f: &mut Func) -> bool {
     let inf = info(f);
@@ -768,6 +807,9 @@ pub fn run(f: &mut Func) -> bool {
             c |= n != b.insts.len();
         }
         c |= fuse_branches(f);
+        if !c {
+            c |= hoist_post_inc_loads(f);
+        }
         if !c {
             c |= narrow(f);
         }
