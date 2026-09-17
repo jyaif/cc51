@@ -1868,8 +1868,8 @@ impl<'a> Gen<'a> {
                     c => (c, a, b),
                 };
                 // Now c is LtU/GeU/LtS/GeS: compute C = (a < b).
-                self.lt_to_c(a, b, ty, c.is_signed());
-                matches!(c, Cond::GeU | Cond::GeS)
+                let inv = self.lt_to_c(a, b, ty, c.is_signed());
+                matches!(c, Cond::GeU | Cond::GeS) != inv
             }
         }
     }
@@ -1886,8 +1886,8 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// C = (a < b) (signed or unsigned), for any width.
-    fn lt_to_c(&mut self, a: Val, b: Val, ty: Ty, signed: bool) {
+    /// C = (a < b) (signed or unsigned), for any width. Returns true if C holds the inverse (a >= b).
+    fn lt_to_c(&mut self, a: Val, b: Val, ty: Ty, signed: bool) -> bool {
         let n = ty.bytes();
         // Constant b: use addition of the negated constant (C = a >= b), then complement.
         if let Val::K(k) = b {
@@ -1897,13 +1897,13 @@ impl<'a> Gen<'a> {
                 let s = self.src(a, n - 1);
                 self.load_a(&s);
                 self.e1(Mn::Rlc, Op::A);
-                return;
+                return false;
             }
             let kk = if signed { ty.norm(k ^ (1i64 << (ty.bits() - 1))) } else { k };
             if kk == 0 {
                 // a' >= 0 always: C = 0 (a < 0 false)
                 self.e1(Mn::Clr, Op::C);
-                return;
+                return false;
             }
             let neg = ty.norm(-kk) as u64;
             let mut started = false;
@@ -1928,9 +1928,8 @@ impl<'a> Gen<'a> {
                 // All bytes of -k are zero only when k == 0 (handled).
                 self.e1(Mn::Setb, Op::C);
             }
-            // C = (a >= k); complement to get a < k.
-            self.e1(Mn::Cpl, Op::C);
-            return;
+            // C = (a >= k): inverted sense.
+            return true;
         }
         if signed {
             // Compare with xor 0x80 on the top bytes using B for b's top byte.
@@ -1954,7 +1953,7 @@ impl<'a> Gen<'a> {
                 }
                 self.place_label(l, false);
                 self.uses_b = true;
-                return;
+                return false;
             }
             self.load_a(&bt);
             self.e2(Mn::Xrl, Op::A, Op::imm(0x80));
@@ -1975,7 +1974,7 @@ impl<'a> Gen<'a> {
                     self.e2(Mn::Subb, Op::A, op);
                 }
             }
-            return;
+            return false;
         }
         for i in 0..n {
             let s = self.src(a, i);
@@ -1995,13 +1994,14 @@ impl<'a> Gen<'a> {
                 }
                 self.place_label(l, true);
                 self.st.c = None;
-                return;
+                return false;
             }
             if i == 0 {
                 self.e1(Mn::Clr, Op::C);
             }
             self.e2(Mn::Subb, Op::A, op);
         }
+        false
     }
 
     fn cmp_to_a(&mut self, c: Cond, a: Val, b: Val, ty: Ty) {
@@ -3256,7 +3256,7 @@ pub fn block_order(f: &Func) -> Vec<BlockId> {
         // Prefer a successor that has this block as its only (or first) predecessor.
         let succs = match &f.blocks[b as usize].term {
             Term::Jmp(t) => vec![*t],
-            Term::Br(_, t, e) | Term::CmpBr(_, _, _, _, t, e) => vec![*e, *t],
+            Term::Br(_, t, e) | Term::CmpBr(_, _, _, _, t, e) => vec![*t, *e],
             Term::Switch(_, _, _, d) => vec![*d],
             _ => vec![],
         };

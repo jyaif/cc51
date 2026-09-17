@@ -106,19 +106,26 @@ pub fn link(sections: Vec<Section>, mut syms: HashMap<Rc<str>, i64>, code_start:
             if !relaxable(ins) || reach[i] == Reach::Long {
                 continue;
             }
+            let is_cond = !matches!(ins.mn, Mn::Call | Mn::Jmp);
             let Some(t) = ins.target() else { continue };
             let Some(tv) = t.resolve(&|s| syms.get(s).copied()) else {
                 return Err(format!("undefined symbol '{}'", t));
             };
             let size = item_size(&items[i].1, reach[i]);
             let next = addr[i] + size;
-            let ok = match ins.mn {
-                Mn::Call => (tv as u32 & 0xf800) == (next & 0xf800),
-                Mn::Jmp => asm::rel_fits(tv, next) || (tv as u32 & 0xf800) == (next & 0xf800),
+            let same_page = |after: u32| (tv as u32 & 0xf800) == (after & 0xf800);
+            let ok = match (ins.mn, reach[i]) {
+                (Mn::Call, _) => same_page(next),
+                (Mn::Jmp, _) => asm::rel_fits(tv, next) || same_page(next),
+                (_, Reach::CondAbs) => same_page(next),
                 _ => asm::rel_fits(tv, next),
             };
             if !ok {
-                reach[i] = Reach::Long;
+                if is_cond && reach[i] == Reach::Short && same_page(next + 2) {
+                    reach[i] = Reach::CondAbs;
+                } else {
+                    reach[i] = Reach::Long;
+                }
                 changed = true;
             }
         }
@@ -188,6 +195,9 @@ pub fn link(sections: Vec<Section>, mut syms: HashMap<Rc<str>, i64>, code_start:
                 continue;
             }
         };
+        if bytes.len() as u32 != item_size(it, reach[i]) {
+            return Err(format!("internal error: size mismatch for {:?} at {:#06x} ({} vs {})", it, a, bytes.len(), item_size(it, reach[i])));
+        }
         let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
         let text = match it {
             Item::Insn(ins) => format!("{}", ins),

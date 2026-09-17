@@ -483,6 +483,8 @@ pub enum Reach {
     Abs11,
     /// ljmp / lcall, or conditional inverted over an ljmp
     Long,
+    /// Conditional jump inverted over an ajmp (target in the same 2K page).
+    CondAbs,
 }
 
 fn reg_n(o: &Op) -> Option<u8> {
@@ -503,28 +505,32 @@ pub fn insn_size(i: &Insn, reach: Reach) -> u32 {
     match i.mn {
         Mn::Jmp if matches!(i.ops.first(), Some(Op::Code(_))) => match reach {
             Reach::Short | Reach::Abs11 => 2,
-            Reach::Long => 3,
+            _ => 3,
         },
         Mn::Call => match reach {
             Reach::Short | Reach::Abs11 => 2,
-            Reach::Long => 3,
+            _ => 3,
         },
         Mn::Jc | Mn::Jnc | Mn::Jz | Mn::Jnz => match reach {
             Reach::Long => 5,
+            Reach::CondAbs => 4,
             _ => 2,
         },
         Mn::Jb | Mn::Jnb | Mn::Jbc => match reach {
-            Reach::Long => 6,
+            Reach::Long => if i.mn == Mn::Jbc { 8 } else { 6 },
+            Reach::CondAbs => if i.mn == Mn::Jbc { 7 } else { 5 },
             _ => 3,
         },
         Mn::Cjne => match reach {
-            Reach::Long => 6,
+            Reach::Long => 8,
+            Reach::CondAbs => 7,
             _ => 3,
         },
         Mn::Djnz => {
             let base = if matches!(i.ops[0], Op::R(_)) { 2 } else { 3 };
             match reach {
                 Reach::Long => base + 2 + 3,
+                Reach::CondAbs => base + 2 + 2,
                 _ => base,
             }
         }
@@ -579,23 +585,24 @@ pub fn encode(i: &Insn, pc: u32, reach: Reach, lookup: &dyn Fn(&str) -> Option<i
             match reach {
                 Reach::Short => Ok(vec![0x80, rel8(t, pc + 2, lookup)?]),
                 Reach::Abs11 => encode_fixed(&Insn::new(Mn::Ajmp, i.ops.clone()), pc, lookup),
-                Reach::Long => encode_fixed(&Insn::new(Mn::Ljmp, i.ops.clone()), pc, lookup),
+                _ => encode_fixed(&Insn::new(Mn::Ljmp, i.ops.clone()), pc, lookup),
             }
         }
         Mn::Call => match reach {
             Reach::Short | Reach::Abs11 => encode_fixed(&Insn::new(Mn::Acall, i.ops.clone()), pc, lookup),
-            Reach::Long => encode_fixed(&Insn::new(Mn::Lcall, i.ops.clone()), pc, lookup),
+            _ => encode_fixed(&Insn::new(Mn::Lcall, i.ops.clone()), pc, lookup),
         },
-        Mn::Jc | Mn::Jnc | Mn::Jz | Mn::Jnz | Mn::Jb | Mn::Jnb | Mn::Jbc | Mn::Cjne | Mn::Djnz if reach == Reach::Long => {
-            // Inverted/short-circuit form: <cond> +3 over an ljmp, e.g. jnc $+5; ljmp target
+        Mn::Jc | Mn::Jnc | Mn::Jz | Mn::Jnz | Mn::Jb | Mn::Jnb | Mn::Jbc | Mn::Cjne | Mn::Djnz if matches!(reach, Reach::Long | Reach::CondAbs) => {
             let t = i.target().unwrap().clone();
-            let mut short = i.clone();
-            let skip_len = match i.mn {
-                Mn::Cjne | Mn::Djnz | Mn::Jbc => 2 + 3, // cond jumps to taken-stub; sjmp over; ljmp
-                _ => 3,
+            let far_len = if reach == Reach::Long { 3 } else { 2 };
+            let far = |at: u32| -> Result<Vec<u8>, EncodeError> {
+                let mn = if reach == Reach::Long { Mn::Ljmp } else { Mn::Ajmp };
+                encode_fixed(&Insn::new(mn, vec![Op::Code(t.clone())]), at, lookup)
             };
             match i.mn {
                 Mn::Jc | Mn::Jnc | Mn::Jz | Mn::Jnz | Mn::Jb | Mn::Jnb => {
+                    // Inverted condition skips over the far jump.
+                    let mut short = i.clone();
                     short.mn = match i.mn {
                         Mn::Jc => Mn::Jnc,
                         Mn::Jnc => Mn::Jc,
@@ -605,21 +612,21 @@ pub fn encode(i: &Insn, pc: u32, reach: Reach, lookup: &dyn Fn(&str) -> Option<i
                         _ => Mn::Jb,
                     };
                     let size = insn_size(&short, Reach::Short);
-                    let after = pc + size + 3;
+                    let after = pc + size + far_len;
                     *short.target_mut().unwrap() = Expr::num(after as i64);
                     let mut v = encode(&short, pc, Reach::Short, lookup)?;
-                    v.extend(encode_fixed(&Insn::new(Mn::Ljmp, vec![Op::Code(t)]), pc + size, lookup)?);
+                    v.extend(far(pc + size)?);
                     Ok(v)
                 }
                 _ => {
-                    // cjne/djnz/jbc: cond jumps to ljmp; otherwise sjmp over it.
+                    // cjne/djnz/jbc: taken path goes to the far jump; otherwise sjmp over it.
+                    let mut short = i.clone();
                     let size = insn_size(&short, Reach::Short);
-                    let ljmp_at = pc + size + 2;
-                    *short.target_mut().unwrap() = Expr::num(ljmp_at as i64);
+                    let far_at = pc + size + 2;
+                    *short.target_mut().unwrap() = Expr::num(far_at as i64);
                     let mut v = encode(&short, pc, Reach::Short, lookup)?;
-                    v.extend([0x80, 3]);
-                    v.extend(encode_fixed(&Insn::new(Mn::Ljmp, vec![Op::Code(t)]), ljmp_at, lookup)?);
-                    let _ = skip_len;
+                    v.extend([0x80, far_len as u8]);
+                    v.extend(far(far_at)?);
                     Ok(v)
                 }
             }
