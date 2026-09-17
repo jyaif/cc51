@@ -11,7 +11,7 @@ int putchar(int c) {
 const char *names[] = {"alpha", "beta"};
 char ram[16] = "ram-string";
 
-void logf(const char *fmt, ...) {
+void logmsg(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   printf("[log] ");
@@ -36,7 +36,7 @@ int main(void) {
   printf("str %s %s %s\n", names[0], names[1], ram);
   int n = sprintf(buf, "%02x:%s:%d", 10, "abc", 123);
   printf("sprintf -> '%s' (%d, strlen %u)\n", buf, n, strlen(buf));
-  logf("value=%d name=%s\n", 7, "seven");
+  logmsg("value=%d name=%s\n", 7, "seven");
   printf("sum=%d\n", sum(4, 1, 2, 3, 4));
   printf("cmp %d %d %d\n", strcmp("abc", "abd") < 0, strcmp("b", "a") > 0, strcmp("x", "x"));
   strcpy(buf, "copy");

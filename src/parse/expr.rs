@@ -1034,6 +1034,19 @@ impl<'a> Parser<'a> {
                 let v = self.prog.has_float_varargs();
                 Ok(Some(Expr::int(v as i64, Type::int(), loc)))
             }
+            "__builtin_inff" | "__builtin_huge_valf" | "__builtin_inf" | "__builtin_huge_val" => {
+                self.expect_p("(")?;
+                self.expect_p(")")?;
+                Ok(Some(Expr::new(ExprKind::Float(f64::INFINITY), Type::new(TypeKind::Float), loc)))
+            }
+            "__builtin_nanf" | "__builtin_nan" => {
+                self.expect_p("(")?;
+                while !self.is_p(")") && !self.at_eof() {
+                    self.pos += 1;
+                }
+                self.expect_p(")")?;
+                Ok(Some(Expr::new(ExprKind::Float(f64::NAN), Type::new(TypeKind::Float), loc)))
+            }
             "__builtin_unreachable" => {
                 self.expect_p("(")?;
                 self.expect_p(")")?;

@@ -196,6 +196,7 @@ static unsigned char __fmt_float(char *buf, float f, unsigned char prec) {
     scaled /= 10;
     if (n == prec) buf[n++] = '.';
   } while (scaled || n <= prec);
+  if (buf[n - 1] == '.') buf[n++] = '0'; /* leading zero */
   /* digits were produced in reverse */
   for (k = 0; k < n / 2; k++) {
     char t = buf[k];
@@ -436,7 +437,15 @@ static int __fs_exp(unsigned long x) { return (int)((x >> 23) & 0xff) - 127; }
 
 static unsigned long __fs_mant(unsigned long x) { return ((x & 0x7fffffUL) | 0x800000UL) << 3; }
 
+#define __FS_QNAN 0x7fc00000UL
+
+static char __fs_isnan(unsigned long a) { return (a & 0x7fffffffUL) > 0x7f800000UL; }
+static char __fs_isinf(unsigned long a) { return (a & 0x7fffffffUL) == 0x7f800000UL; }
+
 unsigned long __fsadd(unsigned long a, unsigned long b) {
+  if (__fs_isnan(a) || __fs_isnan(b)) return __FS_QNAN;
+  if (__fs_isinf(a)) return (__fs_isinf(b) && ((a ^ b) & __FS_SIGN)) ? __FS_QNAN : a;
+  if (__fs_isinf(b)) return b;
   if (!(a & 0x7fffffffUL)) return b;
   if (!(b & 0x7fffffffUL)) return a;
   int ea = __fs_exp(a), eb = __fs_exp(b);
@@ -472,6 +481,11 @@ unsigned long __fssub(unsigned long a, unsigned long b) { return __fsadd(a, b ^ 
 
 unsigned long __fsmul(unsigned long a, unsigned long b) {
   unsigned long sign = (a ^ b) & __FS_SIGN;
+  if (__fs_isnan(a) || __fs_isnan(b)) return __FS_QNAN;
+  if (__fs_isinf(a) || __fs_isinf(b)) {
+    if (!(a & 0x7fffffffUL) || !(b & 0x7fffffffUL)) return __FS_QNAN; /* inf * 0 */
+    return sign | 0x7f800000UL;
+  }
   if (!(a & 0x7fffffffUL) || !(b & 0x7fffffffUL)) return sign;
   unsigned long ma = (a & 0x7fffffUL) | 0x800000UL;
   unsigned long mb = (b & 0x7fffffUL) | 0x800000UL;
@@ -487,7 +501,10 @@ unsigned long __fsmul(unsigned long a, unsigned long b) {
 
 unsigned long __fsdiv(unsigned long a, unsigned long b) {
   unsigned long sign = (a ^ b) & __FS_SIGN;
-  if (!(b & 0x7fffffffUL)) return sign | 0x7f800000UL;
+  if (__fs_isnan(a) || __fs_isnan(b)) return __FS_QNAN;
+  if (__fs_isinf(a)) return __fs_isinf(b) ? __FS_QNAN : (sign | 0x7f800000UL);
+  if (__fs_isinf(b)) return sign;
+  if (!(b & 0x7fffffffUL)) return (a & 0x7fffffffUL) ? (sign | 0x7f800000UL) : __FS_QNAN;
   if (!(a & 0x7fffffffUL)) return sign;
   unsigned long ma = (a & 0x7fffffUL) | 0x800000UL;
   unsigned long mb = (b & 0x7fffffUL) | 0x800000UL;
@@ -545,9 +562,13 @@ long __fs2sl(unsigned long a) {
   return (a & __FS_SIGN) ? -(long)v : (long)v;
 }
 
-char __fseq(unsigned long a, unsigned long b) { return a == b || !((a | b) & 0x7fffffffUL); }
+char __fseq(unsigned long a, unsigned long b) {
+  if (__fs_isnan(a) || __fs_isnan(b)) return 0;
+  return a == b || !((a | b) & 0x7fffffffUL);
+}
 
 char __fslt(unsigned long a, unsigned long b) {
+  if (__fs_isnan(a) || __fs_isnan(b)) return 0;
   if (!((a | b) & 0x7fffffffUL)) return 0;
   if ((a ^ b) & __FS_SIGN) return (a & __FS_SIGN) != 0;
   char neg = (a & __FS_SIGN) != 0;
@@ -813,3 +834,282 @@ void *realloc(void *p, size_t n) {
 /* ---- errno ---- */
 
 int errno;
+
+/* ---- math (single precision) ---- */
+
+union __fbits {
+  float f;
+  unsigned long u;
+};
+
+float fabsf(float x) {
+  union __fbits v;
+  v.f = x;
+  v.u &= 0x7fffffffUL;
+  return v.f;
+}
+
+float ldexpf(float x, int n) {
+  union __fbits v;
+  int e;
+  v.f = x;
+  e = (int)((v.u >> 23) & 0xff);
+  if (e == 0 || e == 255) return x; /* zero, subnormal, inf or nan */
+  e += n;
+  if (e >= 255) {
+    v.u = (v.u & 0x80000000UL) | 0x7f800000UL;
+    return v.f;
+  }
+  if (e <= 0) {
+    v.u &= 0x80000000UL;
+    return v.f;
+  }
+  v.u = (v.u & 0x807fffffUL) | ((unsigned long)e << 23);
+  return v.f;
+}
+
+float frexpf(float x, int *e) {
+  union __fbits v;
+  int ex;
+  v.f = x;
+  ex = (int)((v.u >> 23) & 0xff);
+  if (ex == 0 || ex == 255) {
+    *e = 0;
+    return x;
+  }
+  *e = ex - 126;
+  v.u = (v.u & 0x807fffffUL) | 0x3f000000UL; /* mantissa in [0.5, 1) */
+  return v.f;
+}
+
+float truncf(float x) {
+  if (fabsf(x) >= 8388608.0f) return x;
+  return (float)(long)x;
+}
+
+float floorf(float x) {
+  float t;
+  if (fabsf(x) >= 8388608.0f) return x;
+  t = (float)(long)x;
+  return t > x ? t - 1.0f : t;
+}
+
+float ceilf(float x) {
+  float t;
+  if (fabsf(x) >= 8388608.0f) return x;
+  t = (float)(long)x;
+  return t < x ? t + 1.0f : t;
+}
+
+float roundf(float x) { return x < 0.0f ? -floorf(0.5f - x) : floorf(x + 0.5f); }
+
+float fmodf(float x, float y) {
+  float q;
+  if (y == 0.0f) return 0.0f;
+  q = truncf(x / y);
+  return x - q * y;
+}
+
+float modff(float x, float *ip) {
+  float i = truncf(x);
+  *ip = i;
+  return x - i;
+}
+
+float sqrtf(float x) {
+  float m, r;
+  int e;
+  if (x <= 0.0f) return 0.0f;
+  m = frexpf(x, &e);
+  if (e & 1) {
+    m *= 2.0f;
+    e--;
+  }
+  /* Newton iterations from a linear estimate on [0.5, 2) */
+  r = 0.5f + 0.5f * m;
+  r = 0.5f * (r + m / r);
+  r = 0.5f * (r + m / r);
+  r = 0.5f * (r + m / r);
+  r = 0.5f * (r + m / r);
+  return ldexpf(r, e / 2);
+}
+
+#define __LN2_HI 0.693359375f
+#define __LN2_LO (-2.12194440e-4f)
+
+float expf(float x) {
+  int k;
+  float r, y;
+  if (x > 88.72f) return 3.4028234664e38f * 3.4028234664e38f; /* +inf */
+  if (x < -103.0f) return 0.0f;
+  k = (int)(x * 1.44269504f + (x >= 0.0f ? 0.5f : -0.5f));
+  r = (x - (float)k * __LN2_HI) - (float)k * __LN2_LO;
+  y = 1.0f + r * (1.0f + r * (0.5f + r * (0.16666667f + r * (0.041666667f + r * (0.0083333333f + r * 0.0013888889f)))));
+  return ldexpf(y, k);
+}
+
+float logf(float x) {
+  float m, s, z, y;
+  int e;
+  if (x <= 0.0f) return x < 0.0f ? 0.0f : -3.4028234664e38f * 3.4028234664e38f;
+  m = frexpf(x, &e);
+  if (m < 0.70710678f) {
+    m *= 2.0f;
+    e--;
+  }
+  s = (m - 1.0f) / (m + 1.0f);
+  z = s * s;
+  y = 2.0f * s * (1.0f + z * (0.33333333f + z * (0.2f + z * (0.14285714f + z * (0.11111111f + z * 0.09090909f)))));
+  return y + (float)e * 0.69314718f;
+}
+
+float log10f(float x) { return logf(x) * 0.43429448f; }
+
+/* Argument reduction in units of pi/4 (Cephes): x = y*(pi/4) + z, |z| < pi/4. */
+#define __FOPI 1.27323954f
+#define __DP1 0.78515625f
+#define __DP2 2.4187564849853515625e-4f
+#define __DP3 3.77489497744594108e-8f
+
+static float __sin_poly(float z) {
+  float w = z * z;
+  return z + z * w * (-1.6666654611e-1f + w * (8.3321608736e-3f + w * -1.9515295891e-4f));
+}
+
+static float __cos_poly(float z) {
+  float w = z * z;
+  return 1.0f - 0.5f * w + w * w * (4.166664568298827e-2f + w * (-1.388731625493765e-3f + w * 2.443315711809948e-5f));
+}
+
+/* quad 0: sin, 1: cos */
+static float __trig(float x, unsigned char quad) {
+  float y, z;
+  long j;
+  signed char sign = 1;
+  if (x < 0.0f) {
+    x = -x;
+    if (!quad) sign = -1;
+  }
+  j = (long)(__FOPI * x);
+  y = (float)j;
+  if (j & 1) {
+    j += 1;
+    y += 1.0f;
+  }
+  j &= 7;
+  if (j > 3) {
+    j -= 4;
+    sign = -sign;
+  }
+  if (quad && j > 1) sign = -sign;
+  z = ((x - y * __DP1) - y * __DP2) - y * __DP3;
+  if (quad) y = (j == 1 || j == 2) ? __sin_poly(z) : __cos_poly(z);
+  else y = (j == 1 || j == 2) ? __cos_poly(z) : __sin_poly(z);
+  return sign < 0 ? -y : y;
+}
+
+float sinf(float x) { return __trig(x, 0); }
+float cosf(float x) { return __trig(x, 1); }
+
+float tanf(float x) {
+  float y, z, w;
+  long j;
+  signed char sign = 1;
+  if (x < 0.0f) {
+    x = -x;
+    sign = -1;
+  }
+  j = (long)(__FOPI * x);
+  y = (float)j;
+  if (j & 1) {
+    j += 1;
+    y += 1.0f;
+  }
+  z = ((x - y * __DP1) - y * __DP2) - y * __DP3;
+  w = z * z;
+  if (w > 1e-8f) {
+    z = z + z * w * (3.33331568548e-1f + w * (1.33387994085e-1f + w * (5.34112807005e-2f + w * (2.44301354525e-2f + w * (3.11992232697e-3f + w * 9.38540185543e-3f)))));
+  }
+  if (j & 2) z = -1.0f / z;
+  return sign < 0 ? -z : z;
+}
+
+float atanf(float x) {
+  float a = fabsf(x), z, r;
+  char inv = 0;
+  if (a > 1.0f) {
+    a = 1.0f / a;
+    inv = 1;
+  }
+  z = a * a;
+  r = a * (0.99999933f + z * (-0.33329856f + z * (0.19946536f + z * (-0.13908534f + z * (0.09642004f + z * (-0.05590989f + z * (0.02186123f - z * 0.00405406f)))))));
+  if (inv) r = 1.5707963f - r;
+  return x < 0.0f ? -r : r;
+}
+
+float atan2f(float y, float x) {
+  if (x > 0.0f) return atanf(y / x);
+  if (x < 0.0f) return y >= 0.0f ? atanf(y / x) + 3.14159265f : atanf(y / x) - 3.14159265f;
+  if (y > 0.0f) return 1.57079633f;
+  if (y < 0.0f) return -1.57079633f;
+  return 0.0f;
+}
+
+float asinf(float x) {
+  float a = fabsf(x), r;
+  if (a >= 1.0f) r = 1.57079633f;
+  else r = atanf(a / sqrtf(1.0f - a * a));
+  return x < 0.0f ? -r : r;
+}
+
+float acosf(float x) { return 1.57079633f - asinf(x); }
+
+float sinhf(float x) {
+  float e;
+  if (fabsf(x) < 0.35f) {
+    float z = x * x;
+    return x + x * z * (0.16666667f + z * (0.0083333333f + z * 0.00019841270f));
+  }
+  e = expf(x);
+  return 0.5f * (e - 1.0f / e);
+}
+
+float coshf(float x) {
+  float e = expf(fabsf(x));
+  return 0.5f * (e + 1.0f / e);
+}
+
+float tanhf(float x) {
+  float a = fabsf(x), e, r;
+  if (a > 9.0f) r = 1.0f;
+  else if (a < 0.3f) {
+    float z = x * x;
+    r = a * (1.0f + z * (-0.33333333f + z * (0.13333333f - z * 0.053968254f)));
+  } else {
+    e = expf(2.0f * a);
+    r = (e - 1.0f) / (e + 1.0f);
+  }
+  return x < 0.0f ? -r : r;
+}
+
+float powf(float x, float y) {
+  long n;
+  if (y == 0.0f) return 1.0f;
+  if (x == 0.0f) return 0.0f;
+  n = (long)y;
+  if (x < 0.0f) {
+    /* Only integral exponents are defined for a negative base. */
+    if ((float)n != y) return 0.0f;
+    return (n & 1) ? -expf(y * logf(-x)) : expf(y * logf(-x));
+  }
+  return expf(y * logf(x));
+}
+
+float expm1f(float x) { return fabsf(x) < 0.25f ? x * (1.0f + x * (0.5f + x * (0.16666667f + x * 0.041666667f))) : expf(x) - 1.0f; }
+float log1pf(float x) { return logf(1.0f + x); }
+
+int __signbitf(float x) {
+  union __fbits v;
+  v.f = x;
+  return (int)(v.u >> 31);
+}
