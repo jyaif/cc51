@@ -15,6 +15,8 @@ pub struct GenCtx<'a> {
     pub sym_space: &'a dyn Fn(&Sym) -> Space,
     pub sym_expr: &'a dyn Fn(&Sym) -> Rc<str>,
     pub asm_resolve: &'a dyn Fn(&str) -> Option<SymRes>,
+    /// True if the callee is in the same recursive component as the current function.
+    pub same_scc: &'a dyn Fn(&Callee) -> bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2798,10 +2800,42 @@ impl<'a> Gen<'a> {
                 moves.push((*l, self.src(*a, k as u32)));
             }
         }
+        // Recursive call: save this function's live frame bytes before the arguments are written.
+        let mut saved: Vec<Op> = Vec::new();
+        if (self.cx.same_scc)(c) {
+            let (b, i) = self.cur;
+            let mut seen = std::collections::HashSet::new();
+            for v in self.al.live_after[b][i].iter() {
+                for l in &self.al.locs[v] {
+                    if matches!(l, Loc::Slot(..)) && seen.insert(*l) {
+                        saved.push(loc_op(*l));
+                    }
+                }
+            }
+            for (oi, o) in self.f.frame.iter().enumerate() {
+                if o.space == Space::Data {
+                    for k in 0..o.size {
+                        saved.push(loc_op(Loc::Obj(self.f.id, oi as u32, k as u16)));
+                    }
+                } else if o.space == Space::Idata {
+                    panic!("recursive function '{}' has locals in upper RAM", self.f.name);
+                }
+            }
+            // The indirect call target is already in DPTR; pushes don't disturb it.
+            for op in &saved {
+                self.e1(Mn::Push, op.clone());
+            }
+        }
         // Moves into DPL/DPH/B for an indirect call would clobber the target: not supported.
         self.par_move(moves);
         let sym = (self.cx.callee_sym)(c);
         self.e1(Mn::Call, Op::label(&sym));
+        if !saved.is_empty() {
+            // Keep the return value (A, C, registers) intact while restoring.
+            for op in saved.iter().rev() {
+                self.e1(Mn::Pop, op.clone());
+            }
+        }
         // State after call: keep constants in preserved registers.
         let mut keep = HashMap::new();
         for (k, v) in &self.st.mem {

@@ -30,6 +30,8 @@ pub struct AllocCtx<'a> {
     pub reserved: RegSet,
     /// Only give registers to vregs whose weight is at least this.
     pub min_reg_weight: u32,
+    /// Keep bit values in byte slots (recursive functions save their frame bytes on the stack).
+    pub no_bit_slots: bool,
 }
 
 fn loop_depths(f: &Func) -> Vec<u32> {
@@ -353,7 +355,7 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
             continue;
         }
         let ty = f.vregs[v].ty;
-        if ty == Ty::Bit {
+        if ty == Ty::Bit && !cx.no_bit_slots {
             continue;
         }
         // Registers taken by interfering vregs (per byte position for aligned pairs).
@@ -445,7 +447,7 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
     // Fixed params in memory already carry concrete slots.
     for &v in &order {
         let ty = f.vregs[v].ty;
-        if ty == Ty::Bit {
+        if ty == Ty::Bit && !cx.no_bit_slots {
             if fixed[v] {
                 continue;
             }

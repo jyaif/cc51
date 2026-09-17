@@ -476,35 +476,68 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
             }
         }
     }
-    // Detect recursion.
-    {
-        let mut state = vec![0u8; n];
-        fn dfs(v: usize, callees: &Vec<Vec<usize>>, state: &mut Vec<u8>, stack: &mut Vec<usize>) -> Option<Vec<usize>> {
-            state[v] = 1;
-            stack.push(v);
-            for &w in &callees[v] {
-                if state[w] == 1 {
-                    let pos = stack.iter().position(|x| *x == w).unwrap();
-                    return Some(stack[pos..].to_vec());
+    // Strongly connected components (recursion).
+    let scc_id: Vec<usize> = {
+        // Tarjan's algorithm (iterative-friendly recursion depth is fine for these program sizes).
+        struct T<'a> {
+            callees: &'a Vec<Vec<usize>>,
+            index: Vec<i64>,
+            low: Vec<i64>,
+            on: Vec<bool>,
+            stack: Vec<usize>,
+            next: i64,
+            comp: Vec<usize>,
+            ncomp: usize,
+        }
+        fn strong(t: &mut T, v: usize) {
+            t.index[v] = t.next;
+            t.low[v] = t.next;
+            t.next += 1;
+            t.stack.push(v);
+            t.on[v] = true;
+            for k in 0..t.callees[v].len() {
+                let w = t.callees[v][k];
+                if t.index[w] < 0 {
+                    strong(t, w);
+                    t.low[v] = t.low[v].min(t.low[w]);
+                } else if t.on[w] {
+                    t.low[v] = t.low[v].min(t.index[w]);
                 }
-                if state[w] == 0 {
-                    if let Some(c) = dfs(w, callees, state, stack) {
-                        return Some(c);
+            }
+            if t.low[v] == t.index[v] {
+                loop {
+                    let w = t.stack.pop().unwrap();
+                    t.on[w] = false;
+                    t.comp[w] = t.ncomp;
+                    if w == v {
+                        break;
                     }
                 }
+                t.ncomp += 1;
             }
-            stack.pop();
-            state[v] = 2;
-            None
         }
-        for i in 0..n {
-            if state[i] == 0 {
-                let mut stack = Vec::new();
-                if let Some(cycle) = dfs(i, &callees, &mut state, &mut stack) {
-                    let names: Vec<String> = cycle.iter().map(|c| prog.funcs[fids[*c]].name.to_string()).collect();
-                    return Err(format!("recursion is not supported (cycle: {})", names.join(" -> ")));
+        let mut t = T { callees: &callees, index: vec![-1; n], low: vec![0; n], on: vec![false; n], stack: vec![], next: 0, comp: vec![0; n], ncomp: 0 };
+        for v in 0..n {
+            if t.index[v] < 0 {
+                strong(&mut t, v);
+            }
+        }
+        t.comp
+    };
+    let recursive: Vec<bool> = (0..n).map(|i| callees[i].contains(&i) || (0..n).any(|j| j != i && scc_id[j] == scc_id[i])).collect();
+    for i in 0..n {
+        if recursive[i] {
+            // Recursive functions save their frame bytes with push/pop: keep them directly addressable.
+            for o in funcs[fids[i]].as_mut().unwrap().frame.iter_mut() {
+                if o.space == Space::Idata {
+                    o.space = Space::Data;
                 }
             }
+            let f = funcs[fids[i]].as_ref().unwrap();
+            if f.attrs.interrupt.is_some() {
+                return Err(format!("interrupt handler '{}' cannot be recursive", f.name));
+            }
+            crate::diag::warn(prog.funcs[fids[i]].loc, format!("'{}' is recursive: its stack usage is unbounded", f.name));
         }
     }
     // Bottom-up order (callees first).
@@ -531,10 +564,13 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     let fname_index: HashMap<Rc<str>, usize> = fnames.iter().enumerate().map(|(i, n)| (n.clone(), i)).collect();
     let mut summaries: Vec<Option<Summary>> = vec![None; prog.funcs.len()];
     // Summaries of naked and address-taken functions are fixed up-front.
-    for &fid in &fids {
+    for (i, &fid) in fids.iter().enumerate() {
         let f = funcs[fid].as_ref().unwrap();
         if f.attrs.naked {
             let (p, r) = sdcc_convention(f);
+            summaries[fid] = Some(Summary { params: p, ret: r, clobbers: ALL_REGS, keeps_b: false, keeps_dptr: false });
+        } else if recursive[i] {
+            let (p, r) = fixed_convention(f);
             summaries[fid] = Some(Summary { params: p, ret: r, clobbers: ALL_REGS, keeps_b: false, keeps_dptr: false });
         }
     }
@@ -546,7 +582,15 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     let mut total_uses_dptr: Vec<bool> = vec![false; prog.funcs.len()];
     for &i in &post {
         let fid = fids[i];
-        let f = funcs[fid].as_ref().unwrap();
+        // Fixed-convention functions: parameters get their own vregs so they can move off their register.
+        let f_owned: Func = {
+            let mut f = funcs[fid].as_ref().unwrap().clone();
+            if (addr_taken[i] || recursive[i]) && !f.attrs.naked {
+                split_params(&mut f);
+            }
+            f
+        };
+        let f = &f_owned;
         let callee_summary = |c: &Callee| -> Summary {
             match c {
                 Callee::Direct(x) => summaries[*x].clone().unwrap_or_else(|| {
@@ -562,7 +606,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
             }
         };
         let is_naked = f.attrs.naked;
-        let fixed = if addr_taken[i] { Some(fixed_convention(f)) } else { None };
+        let fixed = if addr_taken[i] || recursive[i] { Some(fixed_convention(f)) } else { None };
         let ret_locs = if is_naked {
             sdcc_convention(f).1
         } else {
@@ -608,6 +652,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
             ret_locs: ret_locs.clone(),
             reserved,
             min_reg_weight: if f.attrs.interrupt.is_some() { 3 } else { 0 },
+            no_bit_slots: recursive[i],
         };
         let al = alloc::allocate(&actx);
         if opts.dump_ir {
@@ -655,7 +700,17 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
                 _ => callee_summary(c),
             }
         };
-        let gcx = GenCtx { callee: &call_sum, callee_sym: &callee_sym, sym_space: &sym_space, sym_expr: &sym_expr, asm_resolve: &resolve };
+        let my_scc = scc_id[i];
+        let is_rec = recursive[i];
+        let same_scc = |c: &Callee| -> bool {
+            match c {
+                Callee::Direct(x) => is_rec && index.get(x).map_or(false, |&j| scc_id[j] == my_scc),
+                // An indirect call may reach any address-taken function, including this one.
+                Callee::Indirect(_) => is_rec,
+                _ => false,
+            }
+        };
+        let gcx = GenCtx { callee: &call_sum, callee_sym: &callee_sym, sym_space: &sym_space, sym_expr: &sym_expr, asm_resolve: &resolve, same_scc: &same_scc };
         let bank = f.attrs.using.unwrap_or(0);
         // Rewrite indirect calls' argument locations by giving them explicit summaries at codegen time.
         let f_for_gen: Func = rewrite_indirect(f, &indirect_summary);
@@ -782,7 +837,8 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
                     })
                     .collect()
             };
-            summaries[fid] = Some(Summary { params, ret: ret_locs.clone(), clobbers: clob, keeps_b: !ub, keeps_dptr: !ud });
+            let clob_s = if recursive[i] { ALL_REGS } else { clob };
+            summaries[fid] = Some(Summary { params, ret: ret_locs.clone(), clobbers: clob_s, keeps_b: !ub && !recursive[i], keeps_dptr: !ud && !recursive[i] });
         }
         // Frame request.
         let mut fr = FrameReq::default();
@@ -1297,6 +1353,44 @@ fn glob_res(prog: &Program, g: usize, gnames: &[Rc<str>]) -> SymRes {
         (Space::Sfr, Some(a)) => SymRes::Const(a as i64),
         (Space::Sbit, Some(a)) => SymRes::Bit(a as i64),
         _ => SymRes::Sym(gnames[g].clone()),
+    }
+}
+
+/// Replace uses of register parameters with copies made at function entry.
+fn split_params(f: &mut Func) {
+    let params: Vec<ir::VReg> = f.params.iter().filter_map(|p| if let ParamLoc::Reg(r) = p { Some(*r) } else { None }).collect();
+    let mut copies = Vec::new();
+    for p in params {
+        let ty = f.ty(p);
+        let n = f.new_vreg(ty);
+        f.vregs[n as usize].name = f.vregs[p as usize].name.clone();
+        for b in f.blocks.iter_mut() {
+            for ins in b.insts.iter_mut() {
+                if ins.def() == Some(p) {
+                    ins.set_def(n);
+                }
+                ins.for_each_val_mut(|v| {
+                    if *v == Val::R(p) {
+                        *v = Val::R(n);
+                    }
+                });
+                if let Inst::CritExit(r) = ins {
+                    if *r == p {
+                        *r = n;
+                    }
+                }
+            }
+            b.term.for_each_val_mut(|v| {
+                if *v == Val::R(p) {
+                    *v = Val::R(n);
+                }
+            });
+        }
+        copies.push(Inst::Copy(n, Val::R(p)));
+    }
+    let entry = &mut f.blocks[0].insts;
+    for (k, c) in copies.into_iter().enumerate() {
+        entry.insert(k, c);
     }
 }
 
