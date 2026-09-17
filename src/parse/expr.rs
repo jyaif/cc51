@@ -962,6 +962,13 @@ impl<'a> Parser<'a> {
                 self.expect_p(",")?;
                 let ty = self.type_name()?;
                 self.expect_p(")")?;
+                // Pointers travel through variable arguments as generic pointers.
+                if let TypeKind::Pointer(p, v) = &ty.kind {
+                    if !p.is_func() {
+                        self.prog.spaces.add_space(*v, Space::Data);
+                        self.prog.spaces.add_space(*v, Space::Code);
+                    }
+                }
                 Ok(Expr::new(ExprKind::Builtin(Builtin::VaArg, vec![ap]), ty, loc))
             }
             _ => {

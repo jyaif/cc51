@@ -120,6 +120,8 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
     let mut ever_live = BitSet::new(n);
     // Internal-RAM pointer dereferences: (base vreg usable in place, vregs live across or used by the instruction).
     let mut ptr_sites: Vec<(Option<usize>, Vec<usize>)> = Vec::new();
+    // Pairs (result, operand) that interfere only across different byte positions.
+    let mut aligned: Vec<(usize, usize)> = Vec::new();
 
     let add_interf = |interf: &mut Vec<BitSet>, a: usize, b: usize| {
         if a != b {
@@ -167,6 +169,20 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
                     for x in l.iter() {
                         if Some(x) != except {
                             add_interf(&mut interf, d as usize, x);
+                        }
+                    }
+                    // Multi-byte operations read operand bytes after writing result bytes: the result may only
+                    // share a location with a (dying) operand at the same byte position.
+                    if f.ty(d).bytes() > 1 && !matches!(ins, Inst::Copy(..) | Inst::Load(..) | Inst::Call(..)) {
+                        for u in ins.uses() {
+                            if u != d && !folded(u) {
+                                let pos_ok = matches!(ins, Inst::Bin(..) | Inst::Un(..)) && f.ty(u) == f.ty(d);
+                                if pos_ok {
+                                    aligned.push((d as usize, u as usize));
+                                } else {
+                                    add_interf(&mut interf, d as usize, u as usize);
+                                }
+                            }
                         }
                     }
                     l.remove(d as usize);
@@ -255,6 +271,11 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
             }
             if site_needed {
                 let mut lv: Vec<usize> = l.iter().collect();
+                if let Some(dd) = ins.def() {
+                    if !folded(dd) {
+                        lv.push(dd as usize);
+                    }
+                }
                 for u in ins.uses() {
                     if !folded(u) && Some(u as usize) != site_base {
                         lv.push(u as usize);
@@ -293,6 +314,16 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
         }
     }
 
+    // Soft (byte-position) conflicts.
+    let mut soft: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(a, b) in &aligned {
+        if !soft[a].contains(&b) {
+            soft[a].push(b);
+            soft[b].push(a);
+        }
+    }
+    let soft_of = |v: usize| -> Vec<usize> { soft[v].clone() };
+
     // --- Assignment ---
     let mut locs: Vec<Vec<Loc>> = vec![Vec::new(); n];
     let mut order: Vec<usize> = (0..n).filter(|&v| !folded(v as VReg) && ever_live.contains(v)).collect();
@@ -325,12 +356,28 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
         if ty == Ty::Bit {
             continue;
         }
-        // Registers taken by interfering vregs.
+        // Registers taken by interfering vregs (per byte position for aligned pairs).
         let mut taken: RegSet = forbid[v] | cx.reserved;
+        let nb_v = ty.bytes() as usize;
+        let mut taken_pos: Vec<RegSet> = vec![0; nb_v];
         for x in interf[v].iter() {
             for l in &locs[x] {
                 if let Loc::R(r) = l {
                     taken |= 1 << r;
+                }
+            }
+        }
+        for x in soft_of(v) {
+            if interf[v].contains(x) {
+                continue;
+            }
+            for (j, l) in locs[x].iter().enumerate() {
+                if let Loc::R(r) = l {
+                    for (k, tp) in taken_pos.iter_mut().enumerate() {
+                        if k != j {
+                            *tp |= 1 << r;
+                        }
+                    }
                 }
             }
         }
@@ -356,6 +403,9 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
             let default: &[u8] = if ptr_base[v] && k == 0 { &[0, 1, 7, 6, 5, 4, 3, 2] } else { &[7, 6, 5, 4, 3, 2, 1, 0] };
             prefs.extend_from_slice(default);
             for r in prefs {
+                if taken_pos[k] & (1 << r) != 0 {
+                    continue;
+                }
                 if r <= 1 && taken & (1 << r) == 0 {
                     // Keep one of R0/R1 available at internal-RAM pointer dereferences.
                     let other = 1 - r;
@@ -433,7 +483,16 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
                 if s == slot_users.len() {
                     slot_users.push(Vec::new());
                 }
-                let ok = slot_users[s].iter().all(|&u| u != v && !interf[v].contains(u));
+                let ok = slot_users[s].iter().all(|&u| {
+                    if u == v || interf[v].contains(u) {
+                        return false;
+                    }
+                    if soft[v].contains(&u) {
+                        // Allowed only at the same byte position.
+                        return locs[u].iter().position(|l| *l == Loc::Slot(f.id, s as u16)) == Some(k);
+                    }
+                    true
+                });
                 if ok {
                     slot_users[s].push(v);
                     locs[v][k] = Loc::Slot(f.id, s as u16);

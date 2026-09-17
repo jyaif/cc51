@@ -338,6 +338,12 @@ fn main() {
     for t in tus {
         converted.push(lex::convert(t).unwrap_or_else(|e| fail(e)));
     }
+    // The C library is a weak unit parsed last.
+    let libc_toks = {
+        let mut pp = pp::Preprocessor::new(vec![], headers::get);
+        let t = pp.preprocess_source(headers::LIBC, Path::new("<libc>")).unwrap_or_else(|e| fail(e));
+        lex::convert(t).unwrap_or_else(|e| fail(e))
+    };
     let mut hint = std::collections::HashSet::new();
     for _ in 0..4 {
         prog = ast::Program::new();
@@ -345,6 +351,7 @@ fn main() {
         for t in &converted {
             parse::parse_tu(t.clone(), &mut prog).unwrap_or_else(|e| fail(e));
         }
+        parse::parse_tu_ex(libc_toks.clone(), &mut prog, true).unwrap_or_else(|e| fail(e));
         let n = prog.spaces.parent.len() as u32;
         let new_hint: std::collections::HashSet<u32> = (0..n).filter(|&v| prog.spaces.resolve(v).is_none() || hint.contains(&v)).collect();
         if new_hint == hint {

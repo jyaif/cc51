@@ -86,6 +86,25 @@ pub struct Builder<'a> {
     sealed: bool,
 }
 
+thread_local! {
+    static VARARG_SIZES: std::cell::RefCell<Vec<u32>> = Default::default();
+}
+
+pub fn set_vararg_sizes(v: Vec<u32>) {
+    VARARG_SIZES.with(|s| *s.borrow_mut() = v);
+}
+
+fn vararg_size(fid: FuncId) -> u32 {
+    VARARG_SIZES.with(|s| s.borrow().get(fid).copied().unwrap_or(0))
+}
+
+/// Frame object index of the variable-argument area of a variadic function.
+pub fn varargs_obj_index(prog: &Program, fid: FuncId) -> u32 {
+    let f = &prog.funcs[fid];
+    let mem_params = (0..f.params.len()).filter(|&j| param_in_memory(prog, f, j)).count() as u32;
+    mem_params + if f.ftype().ret.is_record() { 1 } else { 0 }
+}
+
 pub fn build_func(prog: &Program, fid: FuncId) -> Result<Func> {
     let af = &prog.funcs[fid];
     let ft = af.ftype().clone();
@@ -143,6 +162,11 @@ pub fn build_func(prog: &Program, fid: FuncId) -> Result<Func> {
         let idx = b.f.frame.len() as u32;
         b.f.frame.push(FrameObj { size, space: Space::Data, name: "__retval".into(), param: None });
         b.f.ret_obj = Some(idx);
+    }
+    if ft.variadic {
+        let idx = b.f.frame.len() as u32;
+        debug_assert_eq!(idx, varargs_obj_index(prog, fid));
+        b.f.frame.push(FrameObj { size: vararg_size(fid).max(1), space: Space::Data, name: "__varargs".into(), param: None });
     }
     let body = af.body.as_ref().unwrap();
     if ft.attrs.critical {
@@ -916,7 +940,33 @@ impl<'a> Builder<'a> {
                     None => Ok(Val::K(0)),
                 }
             }
-            ExprKind::Builtin(..) => err(e.loc, "variadic argument access is not supported yet"),
+            ExprKind::Builtin(Builtin::VaStart, args) => {
+                if !self.prog.funcs[self.fid].ftype().variadic {
+                    return err(e.loc, "va_start used in a function with fixed arguments");
+                }
+                let obj = varargs_obj_index(self.prog, self.fid);
+                let lv = self.lvalue(&args[0])?;
+                self.store(&lv, Val::Addr(Sym::Frame(self.fid, obj), 0));
+                Ok(Val::K(0))
+            }
+            ExprKind::Builtin(Builtin::VaArg, args) => {
+                let ap = &args[0];
+                let lv = self.lvalue(ap)?;
+                let p = self.load(&lv);
+                let sp = ptr_pspace(self.prog, &ap.ty);
+                let size = if e.ty.is_bit() { 1 } else { self.prog.size(&e.ty) };
+                let lt = if e.ty.is_bit() { Ty::I8 } else { ty };
+                let t = self.tmp(lt);
+                self.emit(Inst::Load(t, Mem::Ptr(p, 0, sp)));
+                let pt = self.val_ty(p, Ty::I16);
+                let np = self.ptr_offset(p, pt, Val::K(size as i64));
+                self.store(&lv, np);
+                if e.ty.is_bit() {
+                    return Ok(self.resize(Val::R(t), Ty::I8, Ty::Bit, false));
+                }
+                Ok(Val::R(t))
+            }
+            ExprKind::Builtin(_, _) => Ok(Val::K(0)),
         }
     }
 
@@ -1140,11 +1190,31 @@ impl<'a> Builder<'a> {
         };
         let params = def_params.unwrap_or_else(|| ft.params.clone());
         let variadic_extra = args.len() > params.len();
+        // Evaluate variable arguments first; they are stored after all arguments are evaluated.
+        let mut var_vals: Vec<(Val, Ty)> = Vec::new();
         if variadic_extra {
-            return err(e.loc, "calls with variadic arguments are not supported yet");
+            for a in &args[params.len()..] {
+                let v = self.rvalue(a)?;
+                if (a.ty.is_pointer() && !a.ty.is_func_ptr()) || a.ty.is_array() {
+                    // Pass data pointers as generic pointers.
+                    let pt = self.ty(&a.ty);
+                    let gv = if pt == Ty::I24 {
+                        v
+                    } else {
+                        let tag = self.prog.ptr_space(&a.ty).map(|s| s.gptr_tag()).unwrap_or(0x40);
+                        self.make_gptr(v, tag)
+                    };
+                    var_vals.push((gv, Ty::I24));
+                    continue;
+                }
+                let t = if a.ty.is_array() { Ty::I16 } else { self.ty(&a.ty) };
+                let (v, t) = if t == Ty::Bit { (self.resize(v, Ty::Bit, Ty::I8, false), Ty::I8) } else { (v, t) };
+                // Keep constants/addresses as is; registers may be clobbered by later argument calls only if they are memory reads.
+                var_vals.push((v, t));
+            }
         }
         let mut vals = Vec::new();
-        for (i, a) in args.iter().enumerate() {
+        for (i, a) in args.iter().enumerate().take(params.len()) {
             let pt = params.get(i).cloned().unwrap_or_else(|| a.ty.clone());
             if pt.is_record() {
                 let Callee::Direct(fid) = target else { return err(e.loc, "struct arguments to indirect calls are not supported") };
@@ -1159,6 +1229,15 @@ impl<'a> Builder<'a> {
             let v = self.rvalue(a)?;
             let v = if !pt.same(&a.ty) || self.ty(&pt) != self.ty(&a.ty) { self.convert(v, &a.ty, &pt)? } else { v };
             vals.push(v);
+        }
+        if variadic_extra {
+            let Callee::Direct(fid) = target else { return err(e.loc, "variadic calls through function pointers are not supported") };
+            let obj = varargs_obj_index(self.prog, fid);
+            let mut off = 0i32;
+            for (v, t) in var_vals {
+                self.emit(Inst::Store(Mem::Sym(Sym::Frame(fid, obj), off), v, t));
+                off += t.bytes() as i32;
+            }
         }
         if ft.ret.is_void() || ft.ret.is_record() {
             self.emit(Inst::Call(None, target, vals));

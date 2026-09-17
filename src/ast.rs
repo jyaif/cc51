@@ -440,3 +440,114 @@ impl Program {
         }
     }
 }
+
+/// Visit every expression (pre-order) in a statement.
+pub fn walk_stmt_exprs(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
+    match s {
+        Stmt::Expr(e) => walk_expr(e, f),
+        Stmt::Block(v) => v.iter().for_each(|x| walk_stmt_exprs(x, f)),
+        Stmt::If(c, t, e) => {
+            walk_expr(c, f);
+            walk_stmt_exprs(t, f);
+            if let Some(e) = e {
+                walk_stmt_exprs(e, f);
+            }
+        }
+        Stmt::While(c, b) => {
+            walk_expr(c, f);
+            walk_stmt_exprs(b, f);
+        }
+        Stmt::DoWhile(b, c) => {
+            walk_stmt_exprs(b, f);
+            walk_expr(c, f);
+        }
+        Stmt::For(i, c, st, b) => {
+            if let Some(i) = i {
+                walk_stmt_exprs(i, f);
+            }
+            if let Some(c) = c {
+                walk_expr(c, f);
+            }
+            if let Some(st) = st {
+                walk_expr(st, f);
+            }
+            walk_stmt_exprs(b, f);
+        }
+        Stmt::Switch(e, b, _, _) => {
+            walk_expr(e, f);
+            walk_stmt_exprs(b, f);
+        }
+        Stmt::Return(Some(e), _) => walk_expr(e, f),
+        Stmt::Label(_, s) | Stmt::Critical(s) => walk_stmt_exprs(s, f),
+        Stmt::InitLocal(_, inits, _) => {
+            for i in inits {
+                match i {
+                    LocalInit::Scalar(_, _, e) | LocalInit::Aggregate(_, e) => walk_expr(e, f),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    f(e);
+    match &e.kind {
+        ExprKind::Unary(_, a) | ExprKind::Cast(a) | ExprKind::Deref(a) | ExprKind::AddrOf(a) | ExprKind::Member(a, _) | ExprKind::IncDec(a, _, _) => walk_expr(a, f),
+        ExprKind::Binary(_, a, b) | ExprKind::PtrAdd(a, b) | ExprKind::PtrDiff(a, b, _) | ExprKind::Assign(a, b) | ExprKind::CompoundAssign(_, a, b, _) | ExprKind::Comma(a, b) => {
+            walk_expr(a, f);
+            walk_expr(b, f);
+        }
+        ExprKind::Cond(a, b, c) => {
+            walk_expr(a, f);
+            walk_expr(b, f);
+            walk_expr(c, f);
+        }
+        ExprKind::Call(c, args) => {
+            walk_expr(c, f);
+            args.iter().for_each(|a| walk_expr(a, f));
+        }
+        ExprKind::StmtExpr(stmts, v) => {
+            stmts.iter().for_each(|s| walk_stmt_exprs(s, f));
+            if let Some(v) = v {
+                walk_expr(v, f);
+            }
+        }
+        ExprKind::Builtin(_, args) => args.iter().for_each(|a| walk_expr(a, f)),
+        _ => {}
+    }
+}
+
+impl Program {
+    /// Size of the variable-argument area needed by each variadic function.
+    pub fn vararg_sizes(&self) -> Vec<u32> {
+        let mut sizes = vec![0u32; self.funcs.len()];
+        for func in &self.funcs {
+            let Some(body) = &func.body else { continue };
+            walk_stmt_exprs(body, &mut |e| {
+                if let ExprKind::Call(c, args) = &e.kind {
+                    let fid = match &c.kind {
+                        ExprKind::Func(x) => Some(*x),
+                        ExprKind::AddrOf(inner) => match inner.kind {
+                            ExprKind::Func(x) => Some(x),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(fid) = fid {
+                        let ft = self.funcs[fid].ftype();
+                        if ft.variadic && args.len() > ft.params.len() {
+                            let n: u32 = args[ft.params.len()..]
+                                .iter()
+                                .map(|a| if a.ty.is_array() || (a.ty.is_pointer() && !a.ty.is_func_ptr()) { 3 } else if a.ty.is_bit() { 1 } else { self.size(&a.ty) })
+                                .sum();
+                            sizes[fid] = sizes[fid].max(n);
+                        }
+                    }
+                }
+            });
+        }
+        sizes
+    }
+}

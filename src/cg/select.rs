@@ -1185,8 +1185,9 @@ impl<'a> Gen<'a> {
 
     fn is_direct(&self, m: &Mem) -> bool {
         match m {
-            Mem::Sym(s, _) => matches!((self.cx.sym_space)(s), Space::Data | Space::Idata | Space::Sfr),
-            Mem::Abs(Space::Data | Space::Sfr | Space::Idata, a) => *a < 0x100 && !(matches!(m, Mem::Abs(Space::Idata, a) if *a >= 0x80)),
+            Mem::Sym(s, _) => matches!((self.cx.sym_space)(s), Space::Data | Space::Sfr),
+            Mem::Abs(Space::Data | Space::Sfr, a) => *a < 0x100,
+            Mem::Abs(Space::Idata, a) => *a < 0x80,
             _ => false,
         }
     }
@@ -1622,8 +1623,8 @@ impl<'a> Gen<'a> {
         }
         match self.space_of(m) {
             PSpace::S(Space::Data | Space::Idata) if n > 1 => {
-                // Sequential bytes through @Ri.
-                let busy_extra: Vec<Val> = vec![];
+                // Sequential bytes through @Ri (the pointer register must not be a destination).
+                let busy_extra: Vec<Val> = vec![Val::R(d)];
                 let r = self.set_rptr(m, 0, &busy_extra);
                 let base_is_dest = dl.iter().any(|l| *l == Loc::R(r));
                 assert!(!base_is_dest, "pointer register overlaps destination");

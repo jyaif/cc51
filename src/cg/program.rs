@@ -147,6 +147,13 @@ fn sdcc_convention(f: &Func) -> (Vec<Vec<Loc>>, Vec<Loc>) {
 }
 
 pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
+    match compile_with(prog, opts, false) {
+        Err(e) if e.contains("internal RAM exhausted") && opts.iram_size > 128 => compile_with(prog, opts, true),
+        r => r,
+    }
+}
+
+fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<Output, String> {
     ir::set_volatile_syms(
         prog.globals
             .iter()
@@ -190,6 +197,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
     set_global_names(gnames.clone());
 
     // ---- Build IR ----
+    ir::build::set_vararg_sizes(prog.vararg_sizes());
     let mut funcs: Vec<Option<Func>> = Vec::with_capacity(prog.funcs.len());
     for (fid, af) in prog.funcs.iter().enumerate() {
         if af.body.is_none() {
@@ -403,6 +411,33 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         }
     }
 
+    // Objects placed in the upper (indirectly addressed) internal RAM.
+    let idata_globals: HashSet<usize> = reach_g
+        .iter()
+        .copied()
+        .filter(|&g| {
+            let gl = &prog.globals[g];
+            gl.at.is_none() && opts.iram_size > 128 && upper_objects && (gl.space == Space::Idata || (gl.space == Space::Data && (gl.ty.is_array() || gl.ty.is_record())))
+        })
+        .collect();
+    if upper_objects {
+        for f in funcs.iter_mut().flatten() {
+            for o in f.frame.iter_mut() {
+                if o.space == Space::Data && &*o.name != "__varargs" && o.param.is_none() {
+                    o.space = Space::Idata;
+                }
+            }
+        }
+    }
+    let global_space = |g: usize| -> Space {
+        if idata_globals.contains(&g) {
+            Space::Idata
+        } else if prog.globals[g].space == Space::Idata {
+            Space::Data
+        } else {
+            prog.globals[g].space
+        }
+    };
     // ---- Call graph ----
     let fids: Vec<usize> = {
         let mut v: Vec<usize> = reach_f.iter().copied().filter(|f| funcs[*f].is_some()).collect();
@@ -533,7 +568,13 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         } else {
             fixed.as_ref().map(|x| x.1.clone()).unwrap_or_else(|| ret_convention(f.ret))
         };
-        let mem_space = |_m: &Mem| -> Option<Space> { None };
+        let mem_space = |m: &Mem| -> Option<Space> {
+            match m {
+                Mem::Sym(Sym::Global(g), _) => Some(global_space(*g)),
+                Mem::Sym(Sym::Frame(ff, o), _) => funcs[*ff].as_ref().map(|x| x.frame[*o as usize].space),
+                _ => None,
+            }
+        };
         let fold = fold::compute(f, &mem_space);
         // Indirect calls: give the IR callee a fixed-convention summary based on argument types.
         let indirect_summary = |args: &[Val], ret: Option<Ty>| -> Summary {
@@ -586,7 +627,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         let resolve = |name: &str| asm_resolver(tu, name);
         let sym_space = |s: &Sym| -> Space {
             match s {
-                Sym::Global(g) => prog.globals[*g].space,
+                Sym::Global(g) => global_space(*g),
                 Sym::Func(_) => Space::Code,
                 Sym::Frame(ff, o) => funcs[*ff].as_ref().map(|x| x.frame[*o as usize].space).unwrap_or(Space::Data),
                 Sym::Named(_) => Space::Data,
@@ -747,13 +788,13 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         let mut fr = FrameReq::default();
         for (oi, o) in f.frame.iter().enumerate() {
             if o.space == Space::Data || o.space == Space::Idata {
-                fr.objects.push(RamObj { sym: frame_obj_sym(fid, oi as u32), size: o.size });
+                fr.objects.push(RamObj { sym: frame_obj_sym(fid, oi as u32), size: o.size, upper: o.space == Space::Idata });
             }
         }
         if is_naked {
             for (pi, t) in f.param_tys.iter().enumerate().skip(1) {
                 let _ = t;
-                fr.objects.push(RamObj { sym: frame_obj_sym(fid, 1000 + pi as u32), size: t.bytes() });
+                fr.objects.push(RamObj { sym: frame_obj_sym(fid, 1000 + pi as u32), size: t.bytes(), upper: false });
             }
         }
         let mut nslots = al.nslots;
@@ -791,7 +832,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
             }
             continue;
         }
-        match gl.space {
+        match global_space(g) {
             Space::Sfr | Space::Sbit => {}
             Space::Bit => global_bits.push(name),
             Space::Data | Space::Idata => ram_globals.push(g),
@@ -801,7 +842,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
     }
     // Initialized globals first so that zero-initialized ones form a contiguous block to clear.
     ram_globals.sort_by_key(|g| prog.globals[*g].init.as_ref().map_or(1, |i| if i.bytes.iter().all(|b| *b == 0) && i.relocs.is_empty() { 1 } else { 0 }));
-    let mut globals_req: Vec<RamObj> = ram_globals.iter().map(|&g| RamObj { sym: gnames[g].clone(), size: prog.size(&prog.globals[g].ty).max(1) }).collect();
+    let mut globals_req: Vec<RamObj> = ram_globals.iter().map(|&g| RamObj { sym: gnames[g].clone(), size: prog.size(&prog.globals[g].ty).max(1), upper: idata_globals.contains(&g) }).collect();
     // Runtime scratch RAM.
     let rt_mods = runtime_modules();
     let mut rt_needed: Vec<usize> = Vec::new();
@@ -872,7 +913,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         let uses_rt_ram = rt_needed.iter().any(|&m| rt_mods[m].text.contains("__rt_t"));
         if uses_rt_ram {
             for k in 0..8 {
-                globals_req.push(RamObj { sym: format!("__rt_t{}", k).into(), size: 1 });
+                globals_req.push(RamObj { sym: format!("__rt_t{}", k).into(), size: 1, upper: false });
             }
         }
     }
@@ -889,7 +930,20 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
             banks = banks.max(u + 1);
         }
     }
-    let lay = layout::layout(&LayoutInput { iram_size: opts.iram_size, banks, global_bits: global_bits.clone(), globals: globals_req.clone(), frames: frames.clone(), callers, isr_roots })?;
+    let lay = match layout::layout(&LayoutInput { iram_size: opts.iram_size, banks, global_bits: global_bits.clone(), globals: globals_req.clone(), frames: frames.clone(), callers: callers.clone(), isr_roots }) {
+        Ok(l) => l,
+        Err(e) => {
+            let mut msg = format!("{}\n  globals: {} bytes", e, globals_req.iter().map(|g| g.size).sum::<u32>());
+            for (i, fr) in frames.iter().enumerate() {
+                let sz: u32 = fr.objects.iter().map(|o| o.size).sum::<u32>() + fr.slots.len() as u32;
+                if sz > 0 {
+                    let cs: Vec<String> = callers[i].iter().map(|c| prog.funcs[fids[*c]].name.to_string()).collect();
+                    msg.push_str(&format!("\n  frame of {}: {} bytes (called from {})", prog.funcs[fids[i]].name, sz, cs.join(", ")));
+                }
+            }
+            return Err(msg);
+        }
+    };
     let mut syms = lay.syms.clone();
     for (k, v) in abs_syms {
         syms.insert(k, v);
@@ -934,6 +988,9 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
     let needs_clear = ram_globals.iter().any(|g| prog.globals[*g].init.as_ref().map_or(true, |i| i.bytes.iter().any(|b| *b == 0))) || !global_bits.is_empty();
     if needs_clear {
         let mut end = lay.globals_end;
+        if lay.upper_start < opts.iram_size.min(0x100) && idata_globals.iter().any(|g| prog.globals[*g].init.is_none()) {
+            end = opts.iram_size.min(0x100);
+        }
         if !global_bits.is_empty() {
             end = end.max(0x20 + ((global_bits.len() as u32 + 7) / 8));
         }
@@ -945,12 +1002,14 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
             start.push(Item::Insn(crate::asm::Insn::new(Mn::Djnz, vec![Op::R(0), Op::label(&"__clear_loop".into())])));
         }
     }
-    // Initialized data: direct moves.
+    // Initialized data.
     let mut init_moves = 0;
     for &g in &ram_globals {
         let gl = &prog.globals[g];
         let Some(init) = &gl.init else { continue };
         let reloc_at: HashMap<u32, &crate::ast::Reloc> = init.relocs.iter().map(|r| (r.offset, r)).collect();
+        // (offset, value) pairs to write.
+        let mut writes: Vec<(u32, Expr)> = Vec::new();
         let mut k = 0u32;
         while k < init.bytes.len() as u32 {
             if let Some(r) = reloc_at.get(&k) {
@@ -963,25 +1022,40 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
                     1 => vec![e.lo()],
                     2 => vec![e.clone().lo(), e.hi()],
                     _ => {
-                        let tag = r.space_var.map(|_| match r.target {
-                            RelocTarget::Global(x) => prog.globals[x].space.gptr_tag(),
+                        let tag = match r.target {
+                            RelocTarget::Global(x) => global_space(x).gptr_tag(),
                             RelocTarget::Func(_) => 0x80,
-                        });
-                        vec![e.clone().lo(), e.hi(), Expr::num(tag.unwrap_or(0x40) as i64)]
+                        };
+                        vec![e.clone().lo(), e.hi(), Expr::num(tag as i64)]
                     }
                 };
                 for (pi, p) in parts.into_iter().enumerate() {
-                    start.push(Item::Insn(crate::asm::Insn::new(Mn::Mov, vec![Op::Dir(Expr::sym_off(&gnames[g], (k + pi as u32) as i64)), Op::Imm(p)])));
+                    writes.push((k + pi as u32, p));
                 }
                 k += r.size as u32;
                 continue;
             }
             let b = init.bytes[k as usize];
             if b != 0 {
-                start.push(Item::Insn(crate::asm::Insn::new(Mn::Mov, vec![Op::Dir(Expr::sym_off(&gnames[g], k as i64)), Op::imm(b as i64)])));
-                init_moves += 1;
+                writes.push((k, Expr::num(b as i64)));
             }
             k += 1;
+        }
+        let upper = idata_globals.contains(&g);
+        let mut r0_at: Option<u32> = None;
+        for (off, val) in writes {
+            init_moves += 1;
+            if upper {
+                match r0_at {
+                    Some(p) if p + 1 == off => start.push(Item::Insn(crate::asm::Insn::new(Mn::Inc, vec![Op::R(0)]))),
+                    Some(p) if p == off => {}
+                    _ => start.push(Item::Insn(crate::asm::Insn::new(Mn::Mov, vec![Op::R(0), Op::Imm(Expr::sym_off(&gnames[g], off as i64))]))),
+                }
+                r0_at = Some(off);
+                start.push(Item::Insn(crate::asm::Insn::new(Mn::Mov, vec![Op::AtR(0), Op::Imm(val)])));
+            } else {
+                start.push(Item::Insn(crate::asm::Insn::new(Mn::Mov, vec![Op::Dir(Expr::sym_off(&gnames[g], off as i64)), Op::Imm(val)])));
+            }
         }
     }
     let _ = init_moves;

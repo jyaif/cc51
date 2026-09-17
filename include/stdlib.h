@@ -9,4 +9,5 @@ long labs(long j);
 int rand(void);
 void srand(unsigned int seed);
 int atoi(const char *s);
+long atol(const char *s);
 #endif

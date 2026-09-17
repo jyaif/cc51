@@ -90,9 +90,15 @@ pub struct Parser<'a> {
     pending_init: Option<Expr>,
     /// Suppress creation of objects (inside sizeof/typeof).
     in_sizeof: usize,
+    /// Definitions in this unit yield to existing ones (library code).
+    weak: bool,
 }
 
 pub fn parse_tu(toks: Vec<Token>, prog: &mut Program) -> Result<()> {
+    parse_tu_ex(toks, prog, false)
+}
+
+pub fn parse_tu_ex(toks: Vec<Token>, prog: &mut Program, weak: bool) -> Result<()> {
     let tu = prog.tu_count;
     prog.tu_count += 1;
     let mut p = Parser {
@@ -107,6 +113,7 @@ pub fn parse_tu(toks: Vec<Token>, prog: &mut Program) -> Result<()> {
         anon_counter: 0,
         pending_init: None,
         in_sizeof: 0,
+        weak,
     };
     p.builtin_typedefs();
     while !p.at_eof() {
@@ -1550,7 +1557,7 @@ impl<'a> Parser<'a> {
         }
         let fid = self.declare_func(name.clone(), ty, spec, loc, true)?;
         if self.prog.funcs[fid].body.is_some() {
-            if self.prog.funcs[fid].tu != self.tu || spec.inline || self.prog.funcs[fid].is_inline {
+            if self.weak || spec.inline || self.prog.funcs[fid].is_inline {
                 // Duplicate inline definition from another TU: parse and discard.
                 let saved = self.prog.funcs.len();
                 let _ = saved;

@@ -8,6 +8,8 @@ use std::rc::Rc;
 pub struct RamObj {
     pub sym: Rc<str>,
     pub size: u32,
+    /// May (and should) be placed in the indirectly addressed upper RAM.
+    pub upper: bool,
 }
 
 /// Frame of one function.
@@ -42,6 +44,8 @@ pub struct LayoutResult {
     pub globals_end: u32,
     pub bit_bytes: u32,
     pub used: u32,
+    /// Lowest address used by upper-RAM objects (iram_size if none).
+    pub upper_start: u32,
 }
 
 /// Map from a virtual contiguous offset to a physical address, skipping the bit area.
@@ -148,9 +152,63 @@ pub fn layout(inp: &LayoutInput) -> Result<LayoutResult, String> {
         segs.push((reg_end, top));
     }
     let phys = Phys { segs };
+    let ram_top = inp.iram_size.min(0x100);
+    // Upper RAM: globals first (top-down), then frames overlaid by call depth.
+    let mut upper_used = 0u32;
+    for g in inp.globals.iter().filter(|g| g.upper) {
+        upper_used += g.size;
+        syms.insert(g.sym.clone(), (ram_top - upper_used) as i64);
+    }
+    let upper_globals = upper_used;
+    {
+        let mut uend = vec![0u32; inp.frames.len()];
+        let usize_of = |f: &FrameReq| -> u32 { f.objects.iter().filter(|o| o.upper).map(|o| o.size).sum() };
+        let mut main_top = upper_globals;
+        for &f in &order {
+            if isr_ctx[f] {
+                continue;
+            }
+            let mut b = upper_globals;
+            for &c in &inp.callers[f] {
+                b = b.max(uend[c]);
+            }
+            let mut cur = b;
+            for o in inp.frames[f].objects.iter().filter(|o| o.upper) {
+                cur += o.size;
+                syms.insert(o.sym.clone(), ram_top as i64 - cur as i64);
+            }
+            uend[f] = cur;
+            main_top = main_top.max(cur);
+            let _ = usize_of;
+        }
+        let mut top = main_top;
+        for &f in &order {
+            if !isr_ctx[f] {
+                continue;
+            }
+            let mut b = main_top;
+            for &c in &inp.callers[f] {
+                if isr_ctx[c] {
+                    b = b.max(uend[c]);
+                }
+            }
+            let mut cur = b;
+            for o in inp.frames[f].objects.iter().filter(|o| o.upper) {
+                cur += o.size;
+                syms.insert(o.sym.clone(), ram_top as i64 - cur as i64);
+            }
+            uend[f] = cur;
+            top = top.max(cur);
+        }
+        upper_used = top;
+    }
+    if upper_used > ram_top.saturating_sub(0x80) {
+        return Err(format!("internal RAM exhausted: {} bytes of indirectly addressed objects", upper_used));
+    }
+    let upper_start = ram_top - upper_used;
     let mut v = 0u32;
     // Globals: contiguous each.
-    for g in &inp.globals {
+    for g in inp.globals.iter().filter(|g| !g.upper) {
         let at = phys.fit(v, g.size.max(1));
         let a = phys.addr(at).ok_or_else(|| "internal RAM exhausted by global variables".to_string())?;
         syms.insert(g.sym.clone(), a as i64);
@@ -165,7 +223,7 @@ pub fn layout(inp: &LayoutInput) -> Result<LayoutResult, String> {
     let mut place = |f: usize, start: u32, syms: &mut HashMap<Rc<str>, i64>| -> Result<u32, String> {
         let fr = &inp.frames[f];
         let mut cur = start;
-        for o in &fr.objects {
+        for o in fr.objects.iter().filter(|o| !o.upper) {
             let at = phys.fit(cur, o.size.max(1));
             let a = phys.addr(at).ok_or_else(|| format!("internal RAM exhausted placing frame object {}", o.sym))?;
             syms.insert(o.sym.clone(), a as i64);
@@ -215,7 +273,7 @@ pub fn layout(inp: &LayoutInput) -> Result<LayoutResult, String> {
     }
     let ram_end = if used == 0 { reg_end.max(if bit_bytes > 0 { 0x20 + bit_bytes } else { 0 }) } else { phys.addr(used - 1).unwrap() + 1 };
     let ram_end = ram_end.max(if bit_bytes > 0 { 0x20 + bit_bytes } else { reg_end });
-    Ok(LayoutResult { syms, ram_end, globals_end, bit_bytes, used })
+    Ok(LayoutResult { syms, ram_end, globals_end, bit_bytes, used, upper_start })
 }
 
 /// Topological order (callers before callees). Cycles are broken arbitrarily.
