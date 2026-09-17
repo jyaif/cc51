@@ -818,6 +818,30 @@ impl<'a> Gen<'a> {
             return;
         }
         match ins {
+            Inst::Bin(op, _, a, Val::K(k)) if ty == Ty::I16 => {
+                // Low byte of a 16-bit shift.
+                let lo = self.src(a, 0);
+                let hi = self.src(a, 1);
+                let k = k as u32;
+                match op {
+                    BinK::Shl => {
+                        if k >= 8 {
+                            self.e1(Mn::Clr, Op::A);
+                        } else {
+                            self.load_a(&lo);
+                            self.shift8_const(BinK::Shl, k);
+                        }
+                    }
+                    _ => {
+                        if k >= 8 {
+                            self.load_a(&hi);
+                            self.shift8_const(op, k - 8);
+                        } else {
+                            self.shr16_low_to_a(&lo, &hi, k);
+                        }
+                    }
+                }
+            }
             Inst::Bin(op, _, a, b) => self.bin8_to_a(op, a, b),
             Inst::Un(op, _, a) => {
                 self.load_a(&self.src(a, 0));
@@ -2464,6 +2488,10 @@ impl<'a> Gen<'a> {
             }
             return;
         }
+        if n == 2 && (3..=7).contains(&k) {
+            self.shift16_mux(op, dl, a, k);
+            return;
+        }
         let bytes = (k / 8) as usize;
         let bits = k % 8;
         // Byte shift into destination (careful with overlaps: go in the right direction).
@@ -2539,6 +2567,79 @@ impl<'a> Gen<'a> {
                 }
             }
             _ => unreachable!(),
+        }
+    }
+
+    /// Rotate A right by k (0..8).
+    fn rotr_a(&mut self, k: u32) {
+        match k % 8 {
+            0 => {}
+            4 => self.e1(Mn::Swap, Op::A),
+            5 => {
+                self.e1(Mn::Swap, Op::A);
+                self.e1(Mn::Rr, Op::A);
+            }
+            3 => {
+                self.e1(Mn::Swap, Op::A);
+                self.e1(Mn::Rl, Op::A);
+            }
+            k if k < 4 => {
+                for _ in 0..k {
+                    self.e1(Mn::Rr, Op::A);
+                }
+            }
+            k => {
+                for _ in 0..(8 - k) {
+                    self.e1(Mn::Rl, Op::A);
+                }
+            }
+        }
+    }
+
+    /// A = low byte of (hi:lo >> k) for 1 <= k <= 7, computed as rotr_k(((lo ^ hi) & m) ^ lo).
+    fn shr16_low_to_a(&mut self, lo: &Src, hi: &Src, k: u32) {
+        let mask = (1u32 << k) - 1;
+        self.load_a(lo);
+        self.alu(BinK::Xor, hi);
+        self.alu(BinK::And, &Src::K(mask as u8));
+        self.alu(BinK::Xor, lo);
+        self.rotr_a(k);
+    }
+
+    /// 16-bit shift by 3..7 bits using byte rotations.
+    fn shift16_mux(&mut self, op: BinK, dl: &[Loc], a: Val, k: u32) {
+        let lo = self.src(a, 0);
+        let hi = self.src(a, 1);
+        match op {
+            BinK::Shl => {
+                // hi' = rotl_k(((hi ^ lo) & (0xff << (8-k))) ^ hi); lo' = rotl_k(lo) & (0xff << k)
+                let m = (0xffu32 << (8 - k)) & 0xff;
+                self.load_a(&hi);
+                self.alu(BinK::Xor, &lo);
+                self.alu(BinK::And, &Src::K(m as u8));
+                self.alu(BinK::Xor, &hi);
+                self.rotr_a(8 - k);
+                self.store_a(dl[1]);
+                self.load_a(&lo);
+                self.rotr_a(8 - k);
+                self.alu(BinK::And, &Src::K(((0xffu32 << k) & 0xff) as u8));
+                self.store_a(dl[0]);
+            }
+            _ => {
+                self.shr16_low_to_a(&lo, &hi, k);
+                self.store_a(dl[0]);
+                self.load_a(&hi);
+                self.rotr_a(k);
+                let lowmask = 0xffu32 >> k;
+                self.alu(BinK::And, &Src::K(lowmask as u8));
+                if op == BinK::ShrS {
+                    // Sign-extend the (8-k)-bit value: (v ^ s) - s
+                    let sbit = 1u32 << (7 - k);
+                    self.e2(Mn::Xrl, Op::A, Op::imm(sbit as i64));
+                    self.e2(Mn::Add, Op::A, Op::imm(((0x100 - sbit) & 0xff) as i64));
+                }
+                self.store_a(dl[1]);
+            }
         }
     }
 

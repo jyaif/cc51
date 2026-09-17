@@ -56,6 +56,8 @@ enum Role {
     Leaf,
     /// Pointer base for an indexed load/store.
     Ptr,
+    /// Low byte of a wider shift, computed into A.
+    Low8,
 }
 
 impl<'a> Ctx<'a> {
@@ -110,6 +112,7 @@ impl<'a> Ctx<'a> {
                     }
                 }
             }
+            Role::Low8 => matches!(&def, Inst::Bin(BinK::ShrU | BinK::ShrS | BinK::Shl, _, Val::R(_), Val::K(k)) if ty == Ty::I16 && (1..16).contains(k)),
             Role::Ptr => match &def {
                 Inst::Bin(BinK::Add, _, base, Val::R(idx)) if ty == Ty::I16 => {
                     // base must be a constant/address or a simple location; idx must be a zext of an 8-bit value.
@@ -131,10 +134,13 @@ impl<'a> Ctx<'a> {
         }
         *cursor -= 1;
         self.kind[r as usize] = match role {
-            Role::Acc => FoldKind::Acc,
+            Role::Acc | Role::Low8 => FoldKind::Acc,
             Role::Leaf => FoldKind::Leaf,
             Role::Ptr => FoldKind::PtrIdx,
         };
+        if role == Role::Low8 {
+            return true;
+        }
         // Recurse into the def's operands.
         match &def {
             Inst::Bin(op, _, a, bb) => {
@@ -256,9 +262,9 @@ impl<'a> Ctx<'a> {
                         Val::R(x) => self.f.ty(*x),
                         _ => Ty::I16,
                     };
-                    let _ = d;
                     if at == Ty::I8 || at == Ty::Bit {
                         self.try_fold(*a, Role::Acc, bi, &mut cursor);
+                    } else if matches!(ins, Inst::Trunc(..)) && self.f.ty(*d) == Ty::I8 && self.try_fold(*a, Role::Low8, bi, &mut cursor) {
                     } else {
                         self.try_fold(*a, Role::Leaf, bi, &mut cursor);
                     }
