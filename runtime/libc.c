@@ -178,35 +178,75 @@ static void __out_putchar(char c) { putchar(c); }
 
 static void __out_buf(char c) { *__sprintf_buf++ = c; }
 
+/* Print a float with `prec` decimals. Only linked when the program passes floats to printf. */
+static unsigned char __fmt_float(char *buf, float f, unsigned char prec) {
+  unsigned long scaled;
+  unsigned char n = 0, k;
+  float scale = 1.0f;
+  for (k = 0; k < prec; k++) scale *= 10.0f;
+  f *= scale;
+  if (f >= 4294967040.0f) {
+    buf[0] = '?';
+    return 1;
+  }
+  scaled = (unsigned long)f;
+  if (f - (float)scaled >= 0.5f) scaled++;
+  do {
+    buf[n++] = '0' + (unsigned char)(scaled % 10);
+    scaled /= 10;
+    if (n == prec) buf[n++] = '.';
+  } while (scaled || n <= prec);
+  /* digits were produced in reverse */
+  for (k = 0; k < n / 2; k++) {
+    char t = buf[k];
+    buf[k] = buf[n - 1 - k];
+    buf[n - 1 - k] = t;
+  }
+  return n;
+}
+
 static int __vprint(void (*out)(char), const char *fmt, va_list ap) {
   int count = 0;
   char c;
-  char buf[12];
+  char buf[16];
   while ((c = *fmt++)) {
     if (c != '%') {
       out(c);
       count++;
       continue;
     }
-    char left = 0, zero = 0, is_long = 0, sign = 0;
-    unsigned char width = 0;
+    char left = 0, zero = 0, is_long = 0, is_byte = 0, sign = 0, alt = 0;
+    unsigned char width = 0, prec = 0;
+    char has_prec = 0;
     c = *fmt++;
-    if (c == '-') {
-      left = 1;
-      c = *fmt++;
-    }
-    if (c == '0') {
-      zero = 1;
+    for (;;) {
+      if (c == '-') left = 1;
+      else if (c == '0') zero = 1;
+      else if (c == '+') sign = '+';
+      else if (c == ' ') { if (!sign) sign = ' '; }
+      else if (c == '#') alt = 1;
+      else break;
       c = *fmt++;
     }
     while (c >= '0' && c <= '9') {
       width = width * 10 + (c - '0');
       c = *fmt++;
     }
+    if (c == '.') {
+      has_prec = 1;
+      c = *fmt++;
+      while (c >= '0' && c <= '9') {
+        prec = prec * 10 + (c - '0');
+        c = *fmt++;
+      }
+    }
     if (c == 'l') {
       is_long = 1;
       c = *fmt++;
     } else if (c == 'h') {
+      c = *fmt++;
+    } else if (c == 'b') {
+      is_byte = 1;
       c = *fmt++;
     }
     const char *s;
@@ -217,12 +257,31 @@ static int __vprint(void (*out)(char), const char *fmt, va_list ap) {
         s = buf;
         len = 1;
         zero = 0;
+        sign = 0;
         break;
       case 's':
         s = va_arg(ap, char *);
         len = 0;
-        while (s[len]) len++;
+        while (s[len] && (!has_prec || len < prec)) len++;
         zero = 0;
+        sign = 0;
+        break;
+      case 'f':
+      case 'F':
+        if (__builtin_float_varargs()) {
+          float fv = (float)va_arg(ap, float);
+          if (fv < 0.0f) {
+            sign = '-';
+            fv = -fv;
+          }
+          len = __fmt_float(buf, fv, has_prec ? prec : 6);
+          s = buf;
+        } else {
+          s = "<NO FLOAT>";
+          len = 10;
+          sign = 0;
+          zero = 0;
+        }
         break;
       case 'd':
       case 'i':
@@ -235,6 +294,7 @@ static int __vprint(void (*out)(char), const char *fmt, va_list ap) {
         unsigned char base = 10;
         if (c == 'x' || c == 'X' || c == 'p') base = 16;
         if (c == 'o') base = 8;
+        if (c != 'd' && c != 'i') sign = 0;
         if (c == 'p') {
           v = (unsigned int)va_arg(ap, char *);
         } else if (is_long) {
@@ -245,6 +305,7 @@ static int __vprint(void (*out)(char), const char *fmt, va_list ap) {
           }
         } else {
           int iv = va_arg(ap, int);
+          if (is_byte) iv = (c == 'd' || c == 'i') ? (signed char)iv : (unsigned char)iv;
           if ((c == 'd' || c == 'i') && iv < 0) {
             sign = '-';
             v = (unsigned int)-iv;
@@ -260,6 +321,14 @@ static int __vprint(void (*out)(char), const char *fmt, va_list ap) {
           *--p = d < 10 ? '0' + d : (c == 'X' ? 'A' : 'a') + d - 10;
           len++;
         } while (v);
+        if (alt && base == 8 && *p != '0') {
+          *--p = '0';
+          len++;
+        }
+        while (has_prec && len < prec) {
+          *--p = '0';
+          len++;
+        }
         s = p;
         break;
       }
@@ -270,6 +339,7 @@ static int __vprint(void (*out)(char), const char *fmt, va_list ap) {
         s = buf;
         len = 1;
         zero = 0;
+        sign = 0;
         break;
     }
     unsigned char total = len + (sign ? 1 : 0);

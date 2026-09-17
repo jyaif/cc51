@@ -303,6 +303,10 @@ fn parse_string_literal(s: &str, loc: Loc, out: &mut Vec<u8>) -> Result<()> {
             } else {
                 out.push(v as u8);
             }
+        } else if ('\u{E080}'..='\u{E0FF}').contains(&chars[i]) {
+            // A byte from a non-UTF-8 source.
+            out.push(chars[i] as u32 as u8);
+            i += 1;
         } else {
             let mut buf = [0u8; 4];
             out.extend_from_slice(chars[i].encode_utf8(&mut buf).as_bytes());

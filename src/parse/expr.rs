@@ -124,7 +124,7 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let pl = self.promoted_type(&lty);
-                let pr = self.promoted_type(&rhs.ty);
+                let pr = self.promoted_expr_type(&rhs);
                 let common = self.common_type(&pl, &pr);
                 let r = self.conv(rhs, &common);
                 (common, r)
@@ -177,7 +177,7 @@ impl<'a> Parser<'a> {
             if a.ty.is_bit() && b.ty.is_bit() {
                 return Ok((a, b, Type::bit()));
             }
-            let (pa, pb) = (self.promoted_type(&a.ty), self.promoted_type(&b.ty));
+            let (pa, pb) = (self.promoted_expr_type(&a), self.promoted_expr_type(&b));
             let t = self.common_type(&pa, &pb);
             let a = self.conv(a, &t);
             let b = self.conv(b, &t);
@@ -1023,6 +1023,13 @@ impl<'a> Parser<'a> {
                 let v = matches!(self.eval_const(&e), Some(ConstVal::Int(_)));
                 Ok(Some(Expr::int(v as i64, Type::int(), loc)))
             }
+            // Whole-program query used by the library: does any variadic call pass a float?
+            "__builtin_float_varargs" => {
+                self.expect_p("(")?;
+                self.expect_p(")")?;
+                let v = self.prog.has_float_varargs();
+                Ok(Some(Expr::int(v as i64, Type::int(), loc)))
+            }
             "__builtin_unreachable" => {
                 self.expect_p("(")?;
                 self.expect_p(")")?;
@@ -1229,8 +1236,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Promoted type of an expression. A bit-field narrower than int promotes to int,
+    /// whatever its declared type.
+    pub(super) fn promoted_expr_type(&self, e: &Expr) -> Type {
+        if let ExprKind::Member(b, fi) = &e.kind {
+            if let TypeKind::Record(rid) = b.ty.kind {
+                if let Some((_, w)) = self.prog.records[rid].fields[*fi].bits {
+                    if e.ty.is_integer() && !e.ty.is_bool() && (w as u32) < 8 * Type::int_size(IntKind::Int) {
+                        return Type::int();
+                    }
+                }
+            }
+        }
+        self.promoted_type(&e.ty)
+    }
+
     pub(super) fn promote(&mut self, e: Expr) -> Expr {
-        let t = self.promoted_type(&e.ty);
+        let t = self.promoted_expr_type(&e);
         self.conv(e, &t)
     }
 
@@ -1257,8 +1279,8 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn arith_conv(&mut self, l: Expr, r: Expr) -> (Expr, Expr, Type) {
-        let pl = self.promoted_type(&l.ty);
-        let pr = self.promoted_type(&r.ty);
+        let pl = self.promoted_expr_type(&l);
+        let pr = self.promoted_expr_type(&r);
         let t = self.common_type(&pl, &pr);
         let l = self.conv(l, &t);
         let r = self.conv(r, &t);

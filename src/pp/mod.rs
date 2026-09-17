@@ -4,6 +4,38 @@ pub mod lexer;
 
 use crate::diag::{self, Error, Loc, Result, err, error};
 pub use lexer::{PKind, PTok};
+
+/// Source text as characters. Bytes that are not valid UTF-8 (a latin-1 source, say) are mapped
+/// into the private use area so that string literals can recover the original byte.
+pub fn decode_source(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            let mut out = String::with_capacity(bytes.len());
+            let mut i = 0;
+            while i < bytes.len() {
+                let rest = &bytes[i..];
+                match std::str::from_utf8(&rest[..rest.len().min(4)]) {
+                    Ok(s) => {
+                        let c = s.chars().next().unwrap();
+                        out.push(c);
+                        i += c.len_utf8();
+                    }
+                    Err(e) if e.valid_up_to() > 0 => {
+                        let s = std::str::from_utf8(&rest[..e.valid_up_to()]).unwrap();
+                        out.push_str(s);
+                        i += e.valid_up_to();
+                    }
+                    Err(_) => {
+                        out.push(char::from_u32(0xE000 + bytes[i] as u32).unwrap());
+                        i += 1;
+                    }
+                }
+            }
+            out
+        }
+    }
+}
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -127,7 +159,7 @@ impl Preprocessor {
 
     pub fn preprocess_file(&mut self, path: &Path) -> Result<Vec<PTok>> {
         let text = std::fs::read(path).map_err(|e| diag::error_noloc(format!("cannot read {}: {}", path.display(), e)))?;
-        let text = String::from_utf8_lossy(&text).into_owned();
+        let text = decode_source(&text);
         self.preprocess_source(&text, path)
     }
 
@@ -535,7 +567,7 @@ impl Preprocessor {
         } else {
             let bytes = std::fs::read(&path).map_err(|e| error(dtok.loc, format!("cannot read {}: {}", path.display(), e)))?;
             self.deps.push(path.clone());
-            String::from_utf8_lossy(&bytes).into_owned()
+            decode_source(&bytes)
         };
         let fid = diag::add_file(&path.display().to_string());
         let toks = lexer::tokenize(&src, fid)?;

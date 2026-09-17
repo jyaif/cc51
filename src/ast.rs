@@ -560,6 +560,33 @@ impl Program {
         t.is_pointer() && !t.is_func_ptr() && t.space_var().map_or(false, |v| self.spaces.is_generic(v))
     }
 
+    /// Does any call pass a floating-point variable argument?
+    pub fn has_float_varargs(&self) -> bool {
+        let mut found = false;
+        for func in &self.funcs {
+            let Some(body) = &func.body else { continue };
+            walk_stmt_exprs(body, &mut |e| {
+                if let ExprKind::Call(c, args) = &e.kind {
+                    let fid = match &c.kind {
+                        ExprKind::Func(x) => Some(*x),
+                        ExprKind::AddrOf(inner) => match inner.kind {
+                            ExprKind::Func(x) => Some(x),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(fid) = fid {
+                        let ft = self.funcs[fid].ftype();
+                        if ft.variadic && args.len() > ft.params.len() && args[ft.params.len()..].iter().any(|a| a.ty.is_float()) {
+                            found = true;
+                        }
+                    }
+                }
+            });
+        }
+        found
+    }
+
     /// Size of the variable-argument area needed by each variadic function.
     pub fn vararg_sizes(&self) -> Vec<u32> {
         let mut sizes = vec![0u32; self.funcs.len()];
