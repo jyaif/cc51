@@ -575,3 +575,241 @@ int isascii(int c) { return (unsigned char)c < 128; }
 int toascii(int c) { return c & 0x7f; }
 int toupper(int c) { return islower(c) ? c - 32 : c; }
 int tolower(int c) { return isupper(c) ? c + 32 : c; }
+
+/* ---- strings ---- */
+
+void *memccpy(void *dst, const void *src, int c, size_t n) {
+  char *d = dst;
+  const char *s = src;
+  while (n--) {
+    char x = *s++;
+    *d++ = x;
+    if (x == (char)c) return d;
+  }
+  return 0;
+}
+
+char *strstr(const char *h, const char *n) {
+  if (!*n) return (char *)h;
+  while (*h) {
+    const char *a = h, *b = n;
+    while (*a && *b && *a == *b) { a++; b++; }
+    if (!*b) return (char *)h;
+    h++;
+  }
+  return 0;
+}
+
+size_t strspn(const char *s, const char *set) {
+  size_t n = 0;
+  while (s[n] && strchr(set, s[n])) n++;
+  return n;
+}
+
+size_t strcspn(const char *s, const char *set) {
+  size_t n = 0;
+  while (s[n] && !strchr(set, s[n])) n++;
+  return n;
+}
+
+char *strpbrk(const char *s, const char *set) {
+  for (; *s; s++)
+    if (strchr(set, *s)) return (char *)s;
+  return 0;
+}
+
+static char *__strtok_save;
+
+char *strtok(char *s, const char *sep) {
+  char *p;
+  if (!s) s = __strtok_save;
+  if (!s) return 0;
+  s += strspn(s, sep);
+  if (!*s) { __strtok_save = 0; return 0; }
+  p = s + strcspn(s, sep);
+  if (*p) { *p++ = 0; }
+  __strtok_save = p;
+  return s;
+}
+
+size_t memalignment(const void *p) {
+  size_t a = 1;
+  unsigned int v = (unsigned int)(unsigned long)p;
+  if (!v) return 0;
+  while (!(v & a)) a <<= 1;
+  return a;
+}
+
+/* ---- conversions ---- */
+
+char *__uitoa(unsigned int value, char *buf, unsigned char radix) {
+  char tmp[17];
+  unsigned char n = 0;
+  char *p = buf;
+  do {
+    unsigned char d = value % radix;
+    value /= radix;
+    tmp[n++] = d < 10 ? '0' + d : 'A' + d - 10;
+  } while (value);
+  while (n) *p++ = tmp[--n];
+  *p = 0;
+  return buf;
+}
+
+char *__itoa(int value, char *buf, unsigned char radix) {
+  if (radix == 10 && value < 0) {
+    buf[0] = '-';
+    __uitoa((unsigned int)-value, buf + 1, radix);
+    return buf;
+  }
+  return __uitoa((unsigned int)value, buf, radix);
+}
+
+char *__ultoa(unsigned long value, char *buf, unsigned char radix) {
+  char tmp[33];
+  unsigned char n = 0;
+  char *p = buf;
+  do {
+    unsigned char d = value % radix;
+    value /= radix;
+    tmp[n++] = d < 10 ? '0' + d : 'A' + d - 10;
+  } while (value);
+  while (n) *p++ = tmp[--n];
+  *p = 0;
+  return buf;
+}
+
+char *__ltoa(long value, char *buf, unsigned char radix) {
+  if (radix == 10 && value < 0) {
+    buf[0] = '-';
+    __ultoa((unsigned long)-value, buf + 1, radix);
+    return buf;
+  }
+  return __ultoa((unsigned long)value, buf, radix);
+}
+
+/* ---- sorting and searching ---- */
+
+void qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *)) {
+  /* Insertion sort: small code, and n is small on this target. */
+  char *b = base;
+  size_t i, j;
+  for (i = 1; i < n; i++) {
+    for (j = i; j && cmp(b + (j - 1) * size, b + j * size) > 0; j--) {
+      char *x = b + (j - 1) * size, *y = b + j * size;
+      size_t k;
+      for (k = 0; k < size; k++) {
+        char t = x[k];
+        x[k] = y[k];
+        y[k] = t;
+      }
+    }
+  }
+}
+
+void *bsearch(const void *key, const void *base, size_t n, size_t size, int (*cmp)(const void *, const void *)) {
+  const char *b = base;
+  while (n) {
+    size_t m = n / 2;
+    const char *p = b + m * size;
+    int c = cmp(key, p);
+    if (c == 0) return (void *)p;
+    if (c > 0) {
+      b = p + size;
+      n -= m + 1;
+    } else {
+      n = m;
+    }
+  }
+  return 0;
+}
+
+/* ---- heap ---- */
+
+/* The heap lives in external RAM and is only linked in when malloc is used. */
+#ifndef __CC51_HEAP_SIZE
+#define __CC51_HEAP_SIZE 1024
+#endif
+
+struct __blk {
+  unsigned int size; /* payload size; low bit set while allocated */
+  struct __blk __xdata *next;
+};
+
+static __xdata char __heap[__CC51_HEAP_SIZE];
+static struct __blk __xdata *__heap_head;
+static char __heap_ready;
+
+void *malloc(size_t n) {
+  struct __blk __xdata *b;
+  struct __blk __xdata *prev;
+  if (!__heap_ready) {
+    __heap_ready = 1;
+    __heap_head = (struct __blk __xdata *)__heap;
+    __heap_head->size = sizeof(__heap) - sizeof(struct __blk);
+    __heap_head->next = 0;
+  }
+  if (n > (size_t)-1 - sizeof(struct __blk) - 4) return 0;
+  n = (n + 1) & ~1u;
+  if (!n) n = 2;
+  prev = 0;
+  for (b = __heap_head; b; b = b->next) {
+    unsigned int size = b->size & ~1u;
+    if (b->size & 1 || size < n) continue;
+    if (size >= n + sizeof(struct __blk) + 2) {
+      /* split */
+      struct __blk __xdata *nb = (struct __blk __xdata *)((__xdata char *)b + sizeof(struct __blk) + n);
+      nb->size = size - n - sizeof(struct __blk);
+      nb->next = b->next;
+      b->next = nb;
+      b->size = n;
+    }
+    b->size |= 1;
+    (void)prev;
+    return (__xdata char *)b + sizeof(struct __blk);
+  }
+  return 0;
+}
+
+void free(void *p) {
+  struct __blk __xdata *b;
+  struct __blk __xdata *c;
+  if (!p) return;
+  b = (struct __blk __xdata *)((__xdata char *)p - sizeof(struct __blk));
+  b->size &= ~1u;
+  /* coalesce forward */
+  for (c = __heap_head; c; c = c->next) {
+    while (c->next && !(c->size & 1) && !(c->next->size & 1)) {
+      c->size += c->next->size + sizeof(struct __blk);
+      c->next = c->next->next;
+    }
+  }
+}
+
+void *calloc(size_t n, size_t size) {
+  size_t total;
+  void *p;
+  if (n && size > (size_t)-1 / n) return 0; /* overflow */
+  total = n * size;
+  p = malloc(total);
+  if (p) memset(p, 0, total);
+  return p;
+}
+
+void *realloc(void *p, size_t n) {
+  struct __blk __xdata *b;
+  void *q;
+  if (!p) return malloc(n);
+  b = (struct __blk __xdata *)((__xdata char *)p - sizeof(struct __blk));
+  if ((b->size & ~1u) >= n) return p;
+  q = malloc(n);
+  if (q) {
+    memcpy(q, p, b->size & ~1u);
+    free(p);
+  }
+  return q;
+}
+
+/* ---- errno ---- */
+
+int errno;

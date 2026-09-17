@@ -1017,8 +1017,8 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     for (k, v) in abs_syms {
         syms.insert(k, v);
     }
-    // Xdata globals.
-    let mut xptr = opts.xram_start;
+    // Xdata globals. Address 0 is left unused so that no object's address is NULL.
+    let mut xptr = if opts.xram_start == 0 { 1 } else { opts.xram_start };
     for &g in &xdata_globals {
         syms.insert(gnames[g].clone(), xptr as i64);
         xptr += prog.global_size(g).max(1);

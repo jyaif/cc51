@@ -15,4 +15,10 @@ int strcmp(const char *a, const char *b);
 int strncmp(const char *a, const char *b, size_t n);
 char *strchr(const char *s, int c);
 char *strrchr(const char *s, int c);
+void *memccpy(void *dst, const void *src, int c, size_t n);
+char *strstr(const char *h, const char *n);
+size_t strspn(const char *s, const char *set);
+size_t strcspn(const char *s, const char *set);
+char *strpbrk(const char *s, const char *set);
+char *strtok(char *s, const char *sep);
 #endif

@@ -919,6 +919,10 @@ impl<'a> Parser<'a> {
                     }
                     Some(Entry::EnumConst(v)) => Ok(Expr::int(v, Type::int(), loc)),
                     Some(Entry::Typedef(_)) => err(loc, format!("unexpected type name '{}'", name)),
+                    None if matches!(&*name, "true" | "false" | "nullptr") => {
+                        // C23 constants, unless the program declares them itself (C89 code does).
+                        Ok(Expr::int((&*name == "true") as i64, Type::int(), loc))
+                    }
                     None => {
                         if self.is_p("(") {
                             if let Some(e) = self.builtin_call(&name, loc)? {
@@ -1081,7 +1085,15 @@ impl<'a> Parser<'a> {
             let t = self.type_name()?;
             self.expect_p(":")?;
             let e = self.assign()?;
-            if chosen.is_none() && t.same(&cty) && t.is_integer() == cty.is_integer() && t.is_signed() == cty.is_signed() {
+            // Pointer types also have to agree on their target space.
+            let same_space = match (t.space_var(), cty.space_var()) {
+                (Some(a), Some(b)) => {
+                    let sp = |v| self.prog.spaces.is_pinned(v).then(|| self.prog.spaces.resolve(v)).flatten();
+                    sp(a) == sp(b)
+                }
+                _ => true,
+            };
+            if chosen.is_none() && same_space && t.same(&cty) && t.is_integer() == cty.is_integer() && t.is_signed() == cty.is_signed() {
                 chosen = Some(e);
             }
         }

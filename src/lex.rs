@@ -329,11 +329,7 @@ pub fn convert(ptoks: Vec<PTok>) -> Result<Vec<Token>> {
         last_loc = t.loc;
         let tok = match t.kind {
             PKind::Ident => {
-                if &*t.text == "true" || &*t.text == "false" {
-                    Tok::Int((&*t.text == "true") as u64, IntLitTy::Int)
-                } else if &*t.text == "nullptr" {
-                    Tok::Int(0, IntLitTy::Int)
-                } else if let Some(k) = canonical_keyword(&t.text) {
+                if let Some(k) = canonical_keyword(&t.text) {
                     Tok::Kw(k)
                 } else {
                     Tok::Ident(t.text.clone())
