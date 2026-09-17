@@ -1,7 +1,13 @@
+pub mod asm;
 pub mod ast;
+pub mod cg;
+pub mod link;
 pub mod diag;
 pub mod headers;
+pub mod ir;
 pub mod lex;
+pub mod opt;
 pub mod parse;
 pub mod pp;
+pub mod sim;
 pub mod types;

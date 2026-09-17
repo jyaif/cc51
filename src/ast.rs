@@ -195,6 +195,7 @@ pub struct Global {
     pub tentative: bool,
     pub is_extern_decl: bool,
     pub volatile: bool,
+    pub tu: usize,
 }
 
 #[derive(Clone, Debug)]

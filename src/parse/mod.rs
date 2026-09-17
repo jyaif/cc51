@@ -1421,6 +1421,7 @@ impl<'a> Parser<'a> {
             tentative: false,
             is_extern_decl,
             volatile: ty.q.is_volatile,
+            tu: self.tu,
         });
         if linkage == Linkage::External {
             self.prog.externs.insert(name.clone(), Sym::Global(id));
@@ -1681,6 +1682,7 @@ impl<'a> Parser<'a> {
                     tentative: true,
                     is_extern_decl: false,
                     volatile: ty.q.is_volatile,
+                    tu: self.tu,
                 });
                 self.declare(name, Entry::Global(gid));
                 if self.eat_p("=") {
@@ -1750,6 +1752,7 @@ impl<'a> Parser<'a> {
             tentative: false,
             is_extern_decl: false,
             volatile: false,
+            tu: self.tu,
         });
         self.prog.string_pool.insert(data, id);
         id

@@ -1105,6 +1105,7 @@ impl<'a> Parser<'a> {
                 tentative: false,
                 is_extern_decl: false,
                 volatile: false,
+                tu: self.tu,
             });
             return Ok(Expr::new(ExprKind::Global(id), fty, loc));
         }
@@ -1184,7 +1185,13 @@ impl<'a> Parser<'a> {
 
     pub(super) fn promoted_type(&self, t: &Type) -> Type {
         match t.int_kind() {
-            Some((k, _)) if Type::rank(k) < Type::rank(IntKind::Int) => Type::int(),
+            Some((k, s)) if Type::rank(k) < Type::rank(IntKind::Int) => {
+                if !s && Type::int_size(k) == Type::int_size(IntKind::Int) {
+                    Type::uint()
+                } else {
+                    Type::int()
+                }
+            }
             Some((k, s)) => Type::intk(k, s),
             None => t.unqual(),
         }
