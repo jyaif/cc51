@@ -54,8 +54,10 @@ def run(path):
     except subprocess.TimeoutExpired:
         return name, 'CTIMEOUT', ''
     if r.returncode != 0:
-        msg = (r.stderr.strip().splitlines() or ['?'])
-        return name, 'CERR', msg[0] if not verbose else r.stderr
+        lines = r.stderr.strip().splitlines() or ['?']
+        errs = [l for l in lines if 'error' in l or 'panicked' in l] or lines
+        msg = errs[0].replace(os.path.join(OUT, 'src') + '/', '')
+        return name, 'CERR', msg if not verbose else r.stderr
     try:
         r = subprocess.run([SIM, '--max-cycles', '200000000', ihx], capture_output=True, timeout=120)
     except subprocess.TimeoutExpired:

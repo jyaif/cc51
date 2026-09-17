@@ -35,6 +35,8 @@ struct Args {
     map: Option<String>,
     lst: Option<String>,
     print_size: bool,
+    /// `--std-cXX` (ISO) or `--std-sdccXX` (SDCC extensions) selected on the command line.
+    std_pragma: Option<&'static str>,
 }
 
 fn parse_num(s: &str) -> u32 {
@@ -65,6 +67,7 @@ fn parse_args() -> Args {
         map: None,
         lst: None,
         print_size: false,
+        std_pragma: None,
     };
     let mut i = 0;
     while i < argv.len() {
@@ -122,7 +125,9 @@ fn parse_args() -> Args {
                     });
                 } else if let Some(u) = s.strip_prefix("-U") {
                     a.defs.push((format!("-{}", u), None));
-                } else if s.starts_with("-m") || s.starts_with("--std") || s.starts_with("--model") || s == "--no-xinit-opt" || s.starts_with("-W") || s == "--debug" || s == "-g" {
+                } else if let Some(std) = s.strip_prefix("--std-") {
+                    a.std_pragma = Some(if std.starts_with("sdcc") { "std_sdcc11" } else { "std_c11" });
+                } else if s.starts_with("-m") || s.starts_with("--model") || s == "--no-xinit-opt" || s.starts_with("-W") || s == "--debug" || s == "-g" {
                     // accepted for compatibility
                 } else if s.starts_with('-') {
                     eprintln!("cc51: unknown option '{}'", s);
@@ -157,7 +162,14 @@ fn preprocess(a: &Args, path: &Path) -> Result<Vec<pp::PTok>, diag::Error> {
             None => pp.define(k, "1"),
         }
     }
-    pp.preprocess_file(path)
+    let mut toks = pp.preprocess_file(path)?;
+    if let (Some(std), Some(first)) = (a.std_pragma, toks.first()) {
+        let mut t = first.clone();
+        t.kind = pp::PKind::Pragma;
+        t.text = std.into();
+        toks.insert(0, t);
+    }
+    Ok(toks)
 }
 
 fn fail(e: impl std::fmt::Display) -> ! {

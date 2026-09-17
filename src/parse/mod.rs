@@ -84,6 +84,8 @@ pub struct Parser<'a> {
     scopes: Vec<Scope>,
     fctx: Option<FuncCtx>,
     nooverlay: bool,
+    /// ISO C mode (`#pragma std_cXX`): no SDCC-specific argument passing.
+    iso_std: bool,
     pragma_stack: Vec<bool>,
     anon_counter: usize,
     /// Pending expression for initializer brace elision.
@@ -109,6 +111,7 @@ pub fn parse_tu_ex(toks: Vec<Token>, prog: &mut Program, weak: bool) -> Result<(
         scopes: vec![Scope::default()],
         fctx: None,
         nooverlay: false,
+        iso_std: false,
         pragma_stack: Vec::new(),
         anon_counter: 0,
         pending_init: None,
@@ -340,6 +343,8 @@ impl<'a> Parser<'a> {
                 }
             }
             Some("nooverlay") => self.nooverlay = true,
+            Some(w) if w.starts_with("std_sdcc") => self.iso_std = false,
+            Some(w) if w.starts_with("std_c") => self.iso_std = true,
             _ => {}
         }
     }
@@ -964,11 +969,11 @@ impl<'a> Parser<'a> {
             if let Some((_, w)) = f.bits {
                 let w = w as u32;
                 // SDCC-style packing: bit-fields are packed into bytes, LSB first; a field that does not
-                // fit in the current byte starts a new one.
+                // fit in the current (partially used) byte starts a new one, as does any field of 8 bits or more.
                 match bit_unit {
-                    Some((uo, used)) if w > 0 && w <= 8 && used + w <= 8 => {
-                        f.offset = uo;
-                        f.bits = Some((used as u8, w as u8));
+                    Some((uo, used)) if w > 0 && w < 8 && used % 8 != 0 && used % 8 + w <= 8 => {
+                        f.offset = uo + used / 8;
+                        f.bits = Some(((used % 8) as u8, w as u8));
                         bit_unit = Some((uo, used + w));
                     }
                     _ => {
@@ -978,7 +983,7 @@ impl<'a> Parser<'a> {
                         f.offset = off;
                         f.bits = Some((0, w as u8));
                         if w > 0 {
-                            bit_unit = Some((off, if w > 8 { (w + 7) / 8 * 8 } else { w }));
+                            bit_unit = Some((off, w));
                         }
                     }
                 }
@@ -1354,6 +1359,15 @@ impl<'a> Parser<'a> {
         }
         if has_init {
             self.pos += 1;
+            // An earlier declaration may have completed the array type.
+            let ty = match (&ty.kind, &self.prog.globals[gid].ty.kind) {
+                (TypeKind::Array(_, None), TypeKind::Array(_, Some(_))) => {
+                    let mut t = self.prog.globals[gid].ty.clone();
+                    t.q = ty.q.clone();
+                    t
+                }
+                _ => ty,
+            };
             let (items, fty) = self.initializer(&ty)?;
             let data = self.eval_static_init(&fty, &items, loc)?;
             let g = &mut self.prog.globals[gid];

@@ -578,10 +578,39 @@ impl Func {
                         return Err(format!("{}: b{} i{}: def of %{} out of range", self.name, bi, ii, d));
                     }
                 }
+                // Operand widths.
+                let w = |v: &Val| match v {
+                    Val::R(r) => Some(self.ty(*r)),
+                    _ => None,
+                };
+                let bad = match i {
+                    Inst::Copy(d, a) => w(a).map_or(false, |t| t != self.ty(*d)),
+                    Inst::Bin(op, d, a, b2) => {
+                        let dt = self.ty(*d);
+                        w(a).map_or(false, |t| t != dt) || (!matches!(op, BinK::Shl | BinK::ShrU | BinK::ShrS) && w(b2).map_or(false, |t| t != dt))
+                    }
+                    Inst::Un(_, d, a) => w(a).map_or(false, |t| t != self.ty(*d)),
+                    Inst::Cmp(_, _, a, b2, ty) => w(a).map_or(false, |t| t != *ty) || w(b2).map_or(false, |t| t != *ty),
+                    Inst::Ext(d, a, _) => w(a).map_or(false, |t| t.bits() >= self.ty(*d).bits()),
+                    Inst::Trunc(d, a) => w(a).map_or(false, |t| t.bits() <= self.ty(*d).bits()),
+                    _ => false,
+                };
+                if bad {
+                    return Err(format!("{}: b{} i{}: operand width mismatch in {:?}", self.name, bi, ii, i));
+                }
             }
             for u in b.term.uses() {
                 if u >= n {
                     return Err(format!("{}: b{} term: use of %{} out of range", self.name, bi, u));
+                }
+            }
+            if let Term::CmpBr(_, a, b2, ty, _, _) = &b.term {
+                for v in [a, b2] {
+                    if let Val::R(r) = v {
+                        if self.ty(*r) != *ty {
+                            return Err(format!("{}: b{} term: operand width mismatch in {:?}", self.name, bi, b.term));
+                        }
+                    }
                 }
             }
             for s in b.term.succs() {

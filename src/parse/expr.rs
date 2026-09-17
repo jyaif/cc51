@@ -801,7 +801,7 @@ impl<'a> Parser<'a> {
         let mut char_cast = Vec::new();
         if !self.is_p(")") {
             loop {
-                let starts_with_cast = ft.variadic && args.len() >= ft.params.len() && self.is_p("(") && self.is_typename_tok(&self.peek_at(1).clone());
+                let starts_with_cast = !self.iso_std && ft.variadic && args.len() >= ft.params.len() && self.is_p("(") && self.is_typename_tok(&self.peek_at(1).clone());
                 let a = self.assign()?;
                 char_cast.push(starts_with_cast && a.ty.is_integer() && self.prog.size(&a.ty) == 1 && !a.ty.is_bool());
                 args.push(a);

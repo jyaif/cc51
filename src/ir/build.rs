@@ -16,8 +16,8 @@ enum Storage {
 enum LVal {
     Reg(VReg),
     Mem(Mem, Ty),
-    /// Bit-field inside memory: (mem of first storage byte, bit offset, width, value type if signed)
-    Bits(Mem, u8, u8, Option<Ty>),
+    /// Bit-field inside memory: (mem of first storage byte, bit offset, width, value type, signed)
+    Bits(Mem, u8, u8, Ty, bool),
     /// 16/32-bit SFR composed of separate byte addresses (little-endian order).
     SfrMulti(Vec<u32>),
 }
@@ -59,10 +59,9 @@ fn mem_add(m: Mem, k: i32) -> Mem {
 }
 
 /// Frame object index used for a parameter that is received in memory.
-pub fn param_in_memory(prog: &Program, f: &Function, i: usize) -> bool {
+pub fn param_in_memory(_prog: &Program, f: &Function, i: usize) -> bool {
     let lid = f.params[i];
-    let l = &f.locals[lid];
-    !l.ty.is_scalar() || l.addr_taken
+    !f.locals[lid].ty.is_scalar()
 }
 
 pub fn param_frame_index(prog: &Program, f: &Function, i: usize) -> Option<u32> {
@@ -153,8 +152,18 @@ pub fn build_func(prog: &Program, fid: FuncId) -> Result<Func> {
         } else {
             let v = b.f.new_vreg(ty);
             b.f.vregs[v as usize].name = Some(l.name.clone());
-            b.locals.insert(lid, Storage::Reg(v));
             b.f.params.push(ParamLoc::Reg(v));
+            if l.addr_taken {
+                // Received in a register, then kept in memory.
+                let idx = b.f.frame.len() as u32;
+                b.f.frame.push(FrameObj { size: prog.size(&l.ty), space: Space::Data, name: l.name.clone(), param: None });
+                b.locals.insert(lid, Storage::Frame(idx));
+                let sty = if ty == Ty::Bit { Ty::I8 } else { ty };
+                let sv = if ty == Ty::Bit { b.resize(Val::R(v), Ty::Bit, Ty::I8, false) } else { Val::R(v) };
+                b.emit(Inst::Store(Mem::Sym(Sym::Frame(b.fid, idx), 0), sv, sty));
+            } else {
+                b.locals.insert(lid, Storage::Reg(v));
+            }
         }
     }
     if ft.ret.is_record() {
@@ -318,7 +327,8 @@ impl<'a> Builder<'a> {
                 let TypeKind::Record(rid) = b.ty.kind else { return err(e.loc, "member of non-record") };
                 let f = &self.prog.records[rid].fields[*fi];
                 let (off, bits) = (f.offset, f.bits);
-                let signed = if f.ty.is_signed() && !f.ty.is_bool() { Some(self.ty(&f.ty)) } else { None };
+                let signed = f.ty.is_signed() && !f.ty.is_bool();
+                let vty = self.ty(&f.ty);
                 let base = self.lvalue(b)?;
                 let m = match base {
                     LVal::Mem(m, _) => m,
@@ -326,7 +336,7 @@ impl<'a> Builder<'a> {
                 };
                 let m = mem_add(m, off as i32);
                 if let Some((bo, w)) = bits {
-                    return Ok(LVal::Bits(m, bo, w, signed));
+                    return Ok(LVal::Bits(m, bo, w, vty, signed));
                 }
                 Ok(LVal::Mem(m, ety))
             }
@@ -348,9 +358,12 @@ impl<'a> Builder<'a> {
                     _ => err(e.loc, "indirect call returning a struct is not supported"),
                 }
             }
-            ExprKind::Assign(l, _) if e.ty.is_record() => {
-                self.rvalue(e)?;
-                self.lvalue(l)
+            ExprKind::Assign(l, r) if e.ty.is_record() => {
+                let size = self.prog.size(&e.ty);
+                let src = self.agg_mem(r)?;
+                let dst = self.agg_mem(l)?;
+                self.emit(Inst::MemCopy(dst, src, size));
+                Ok(LVal::Mem(dst, Ty::I8))
             }
             ExprKind::Cond(c, a, b) if e.ty.is_record() => {
                 // Copy the selected aggregate into a temporary frame object.
@@ -433,7 +446,7 @@ impl<'a> Builder<'a> {
                 self.emit(Inst::Load(t, *m));
                 Val::R(t)
             }
-            LVal::Bits(m, bo, w, signed) => {
+            LVal::Bits(m, bo, w, vty, signed) => {
                 let nbytes = ((*bo as u32 + *w as u32) + 7) / 8;
                 let sty = Ty::from_bytes(if nbytes <= 1 { 1 } else if nbytes <= 2 { 2 } else { 4 });
                 let raw = self.load_bytes(*m, nbytes, sty);
@@ -447,8 +460,8 @@ impl<'a> Builder<'a> {
                 let t = self.tmp(sty);
                 self.emit(Inst::Bin(BinK::And, t, v, Val::K(mask)));
                 v = Val::R(t);
-                if let Some(vty) = *signed {
-                    // Sign-extend from w bits, then to the field's type.
+                if *signed {
+                    // Sign-extend from w bits.
                     let sh = sty.bits() as i64 - *w as i64;
                     if sh > 0 {
                         let t1 = self.tmp(sty);
@@ -457,13 +470,9 @@ impl<'a> Builder<'a> {
                         self.emit(Inst::Bin(BinK::ShrS, t2, Val::R(t1), Val::K(sh)));
                         v = Val::R(t2);
                     }
-                    if vty.bits() > sty.bits() {
-                        let t = self.tmp(vty);
-                        self.emit(Inst::Ext(t, v, true));
-                        v = Val::R(t);
-                    }
                 }
-                v
+                // Then to the field's type.
+                self.resize(v, sty, *vty, *signed)
             }
             LVal::SfrMulti(addrs) => {
                 let n = addrs.len() as u32;
@@ -516,7 +525,7 @@ impl<'a> Builder<'a> {
         match lv {
             LVal::Reg(r) => self.emit(Inst::Copy(*r, v)),
             LVal::Mem(m, ty) => self.emit(Inst::Store(*m, v, *ty)),
-            LVal::Bits(m, bo, w, _) => {
+            LVal::Bits(m, bo, w, _, _) => {
                 let nbytes = ((*bo as u32 + *w as u32) + 7) / 8;
                 let sty = Ty::from_bytes(if nbytes <= 1 { 1 } else if nbytes <= 2 { 2 } else { 4 });
                 let mask = if *w as u32 >= sty.bits() { sty.mask() as i64 } else { ((1i64 << *w) - 1) << *bo };
@@ -890,8 +899,8 @@ impl<'a> Builder<'a> {
                 let lv = self.lvalue(l)?;
                 // Keep the stored value in a vreg only if needed later (the optimizer removes the copy otherwise).
                 self.store(&lv, v);
-                if let LVal::Bits(_, _, w, signed) = lv {
-                    if signed.is_some() {
+                if let LVal::Bits(_, _, w, _, signed) = lv {
+                    if signed {
                         return Ok(self.load(&lv));
                     }
                     // The value of the assignment is the truncated bit-field value.
@@ -1586,7 +1595,7 @@ impl<'a> Builder<'a> {
                             let m = mem_add(base, *off as i32);
                             let ety = self.ty(&e.ty);
                             let lv = match bits {
-                                Some((bo, w)) => LVal::Bits(m, *bo, *w, None),
+                                Some((bo, w)) => LVal::Bits(m, *bo, *w, ety, false),
                                 None => LVal::Mem(m, ety),
                             };
                             self.store(&lv, v);

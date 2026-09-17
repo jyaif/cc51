@@ -80,6 +80,8 @@ pub struct Gen<'a> {
     cur: (usize, usize),
     /// Register pushed by `set_rptr` that must be restored after the access.
     pending_pop: Option<u8>,
+    /// Base pointer register adjusted in place during the current instruction: (register, vreg, offset).
+    rptr_adj: Option<(u8, VReg, i32)>,
     pub uses_b: bool,
     pub uses_dptr: bool,
     is_isr: bool,
@@ -104,6 +106,7 @@ impl<'a> Gen<'a> {
             scratch: 0,
             cur: (0, 0),
             pending_pop: None,
+            rptr_adj: None,
             uses_b: false,
             uses_dptr: false,
             is_isr: f.attrs.interrupt.is_some(),
@@ -1354,13 +1357,17 @@ impl<'a> Gen<'a> {
                 if let Some(Loc::R(r)) = self.locs(*pr).first().copied() {
                     if r <= 1 {
                         let live_after = self.al.live_after[self.cur.0][self.cur.1].contains(*pr as usize);
-                        if off == 0 {
+                        // The register may already have been moved by an earlier access in this instruction.
+                        let cur = self.rptr_adj.filter(|a| a.0 == r && a.1 == *pr).map_or(0, |a| a.2);
+                        let delta = off - cur;
+                        if delta == 0 {
                             return r;
                         }
-                        if !live_after && busy & (1 << r) == 0 && (1..=3).contains(&off) {
-                            for _ in 0..off {
-                                self.e1(Mn::Inc, Op::R(r));
+                        if (cur != 0 || (!live_after && busy & (1 << r) == 0)) && (-3..=3).contains(&delta) {
+                            for _ in 0..delta.abs() {
+                                self.e1(if delta > 0 { Mn::Inc } else { Mn::Dec }, Op::R(r));
                             }
+                            self.rptr_adj = Some((r, *pr, off));
                             return r;
                         }
                         busy |= 1 << r;
@@ -1662,8 +1669,12 @@ impl<'a> Gen<'a> {
                 self.release_rptr();
             }
             PSpace::S(Space::Xdata | Space::Pdata) if n > 1 => {
+                // The destination may overlap the base pointer: set DPTR once.
+                self.set_dptr_mem(m, 0);
                 for k in 0..n {
-                    self.set_dptr_mem(m, k);
+                    if k > 0 {
+                        self.e1(Mn::Inc, Op::Dptr);
+                    }
                     self.e2(Mn::Movx, Op::A, Op::AtDptr);
                     self.store_a(dl[k as usize]);
                 }
@@ -2124,6 +2135,7 @@ impl<'a> Gen<'a> {
     // Instructions
 
     fn gen_inst(&mut self, ins: &Inst) {
+        self.rptr_adj = None;
         if let Some(d) = ins.def() {
             if self.fold.kind[d as usize] != FoldKind::None {
                 return;
@@ -3408,6 +3420,7 @@ impl<'a> Gen<'a> {
                 self.check_balanced();
             }
             self.cur = (b as usize, blk.insts.len());
+            self.rptr_adj = None;
             match &blk.term {
                 Term::Jmp(t) => {
                     if next != Some(*t) {
