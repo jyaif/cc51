@@ -121,7 +121,7 @@ __divsint:
 	mov	a,r6
 	xrl	a,r2
 	push	acc
-	acall	__abs_args16
+	call	__abs_args16
 	lcall	__divuint
 	pop	acc
 	jnb	acc.7,__divsint_ret
@@ -131,7 +131,7 @@ __divsint_ret:
 __modsint:
 	mov	a,r6
 	push	acc
-	acall	__abs_args16
+	call	__abs_args16
 	lcall	__moduint
 	pop	acc
 	jnb	acc.7,__divsint_ret
@@ -147,7 +147,7 @@ __neg16:
 __abs_args16:
 	mov	a,r6
 	jnb	acc.7,__abs_args16_b
-	acall	__neg16
+	call	__neg16
 __abs_args16_b:
 	mov	a,r2
 	jnb	acc.7,__abs_args16_ret
@@ -167,7 +167,7 @@ __divschar_ab:
 	mov	r7,a
 	xrl	a,b
 	mov	r6,a
-	acall	__abs_ab8
+	call	__abs_ab8
 	div	ab
 	xch	a,r6
 	jnb	acc.7,__divschar_pos
@@ -181,7 +181,7 @@ __divschar_pos:
 __modschar_ab:
 	mov	r7,a
 	mov	r6,a
-	acall	__abs_ab8
+	call	__abs_ab8
 	div	ab
 	mov	a,r6
 	jnb	acc.7,__modschar_pos
@@ -335,7 +335,7 @@ __divslong:
 	mov	a,r4
 	xrl	a,r0
 	push	acc
-	acall	__abs_args32
+	call	__abs_args32
 	lcall	__divulong
 	pop	acc
 	jnb	acc.7,__divslong_ret
@@ -345,7 +345,7 @@ __divslong_ret:
 __modslong:
 	mov	a,r4
 	push	acc
-	acall	__abs_args32
+	call	__abs_args32
 	lcall	__modulong
 	pop	acc
 	jnb	acc.7,__divslong_ret
@@ -367,7 +367,7 @@ __neg32:
 __abs_args32:
 	mov	a,r4
 	jnb	acc.7,__abs_args32_b
-	acall	__neg32
+	call	__neg32
 __abs_args32_b:
 	mov	a,r0
 	jnb	acc.7,__abs_args32_ret

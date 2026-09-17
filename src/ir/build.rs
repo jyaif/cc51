@@ -647,8 +647,9 @@ impl<'a> Builder<'a> {
                 self.emit(Inst::Trunc(t, v));
                 return Ok(Val::R(t));
             }
+            let (v, z, ft) = self.gptr_cmp_operands(v, Val::K(0), ft);
             let t = self.tmp(tt);
-            self.emit(Inst::Cmp(Cond::Ne, t, v, Val::K(0), ft));
+            self.emit(Inst::Cmp(Cond::Ne, t, v, z, ft));
             return Ok(Val::R(t));
         }
         // Pointer conversions between generic and specific.
@@ -676,7 +677,55 @@ impl<'a> Builder<'a> {
         Ok(self.resize(v, ft, tt, from.is_signed()))
     }
 
+    /// Operands for comparing generic pointers: a pointer whose address bytes are zero is NULL
+    /// whatever its tag (as in SDCC).
+    fn gptr_cmp_operands(&mut self, a: Val, b: Val, ty: Ty) -> (Val, Val, Ty) {
+        if ty != Ty::I24 {
+            return (a, b, ty);
+        }
+        let is_null = |v: Val| matches!(v, Val::K(k) if k & 0xffff == 0);
+        if is_null(a) || is_null(b) {
+            let other = if is_null(b) { a } else { b };
+            let lo = self.resize(other, Ty::I24, Ty::I16, false);
+            return if is_null(b) { (lo, Val::K(0), Ty::I16) } else { (Val::K(0), lo, Ty::I16) };
+        }
+        (self.gptr_normalize(a), self.gptr_normalize(b), ty)
+    }
+
+    fn gptr_normalize(&mut self, v: Val) -> Val {
+        if !matches!(v, Val::R(_)) {
+            return v;
+        }
+        let lo = self.resize(v, Ty::I24, Ty::I16, false);
+        let nz = self.tmp(Ty::I8);
+        self.emit(Inst::Cmp(Cond::Ne, nz, lo, Val::K(0), Ty::I16));
+        let m = self.tmp(Ty::I8);
+        self.emit(Inst::Bin(BinK::Sub, m, Val::K(0), Val::R(nz)));
+        let hi = self.tmp(Ty::I24);
+        self.emit(Inst::Bin(BinK::ShrU, hi, v, Val::K(16)));
+        let hi8 = self.resize(Val::R(hi), Ty::I24, Ty::I8, false);
+        let tg = self.tmp(Ty::I8);
+        self.emit(Inst::Bin(BinK::And, tg, hi8, Val::R(m)));
+        let tg24 = self.resize(Val::R(tg), Ty::I8, Ty::I24, false);
+        let sh = self.tmp(Ty::I24);
+        self.emit(Inst::Bin(BinK::Shl, sh, tg24, Val::K(16)));
+        let lo24 = self.resize(lo, Ty::I16, Ty::I24, false);
+        let r = self.tmp(Ty::I24);
+        self.emit(Inst::Bin(BinK::Or, r, lo24, Val::R(sh)));
+        Val::R(r)
+    }
+
     fn make_gptr(&mut self, v: Val, tag: u8) -> Val {
+        // The address of a known object carries its own space (the type's space class may be ambiguous).
+        let tag = match v {
+            Val::Addr(Sym::Global(g), _) => match self.prog.globals[g].space {
+                s @ (Space::Code | Space::Xdata | Space::Pdata) => s.gptr_tag(),
+                _ => Space::Data.gptr_tag(),
+            },
+            Val::Addr(Sym::Func(_), _) => Space::Code.gptr_tag(),
+            Val::Addr(Sym::Frame(..), _) => Space::Data.gptr_tag(),
+            _ => tag,
+        };
         if let Val::K(k) = v {
             return Val::K((k & 0xffff) | ((tag as i64) << 16));
         }
@@ -841,8 +890,9 @@ impl<'a> Builder<'a> {
                             self.emit(Inst::Cmp(Cond::Eq, t, Val::R(m), Val::K(0), Ty::I32));
                             return Ok(Val::R(t));
                         }
+                        let (v, z, at) = self.gptr_cmp_operands(v, Val::K(0), at);
                         let t = self.tmp(Ty::I8);
-                        self.emit(Inst::Cmp(Cond::Eq, t, v, Val::K(0), at));
+                        self.emit(Inst::Cmp(Cond::Eq, t, v, z, at));
                         Ok(self.resize(Val::R(t), Ty::I8, ty, false))
                     }
                     UnOp::Neg => {
@@ -1093,6 +1143,7 @@ impl<'a> Builder<'a> {
                     return self.float_cmp(op, av, bv, ty);
                 }
                 let at = self.ty(&a.ty);
+                let (av, bv, at) = self.gptr_cmp_operands(av, bv, at);
                 let cond = cond_of(op, a.ty.is_signed() && !a.ty.is_pointer());
                 let t = self.tmp(Ty::I8);
                 self.emit(Inst::Cmp(cond, t, av, bv, at));
@@ -1228,7 +1279,7 @@ impl<'a> Builder<'a> {
         if variadic_extra {
             for a in &args[params.len()..] {
                 let v = self.rvalue(a)?;
-                if (a.ty.is_pointer() && !a.ty.is_func_ptr()) || a.ty.is_array() {
+                if self.prog.is_generic_vararg_ptr(&a.ty) || a.ty.is_array() {
                     // Pass data pointers as generic pointers.
                     let pt = self.ty(&a.ty);
                     let gv = if pt == Ty::I24 {
@@ -1314,6 +1365,7 @@ impl<'a> Builder<'a> {
                 let av = self.rvalue(a)?;
                 let bv = self.rvalue(b)?;
                 let at = self.ty(&a.ty);
+                let (av, bv, at) = self.gptr_cmp_operands(av, bv, at);
                 let cond = cond_of(*op, a.ty.is_signed() && !a.ty.is_pointer());
                 self.terminate(Term::CmpBr(cond, av, bv, at, t, f));
                 Ok(())

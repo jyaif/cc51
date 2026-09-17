@@ -634,6 +634,14 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A pointer type that is always generic (several target spaces).
+    pub(super) fn generic_ptr_to(&mut self, t: Type) -> Type {
+        let v = self.prog.spaces.new_var(Some(Space::Data));
+        self.prog.spaces.add_space(v, Space::Code);
+        self.prog.spaces.add_space(v, Space::Xdata);
+        Type::new(TypeKind::Pointer(Rc::new(t), v))
+    }
+
     fn mark_addr_taken(&mut self, e: &Expr) {
         match &e.kind {
             ExprKind::Global(g) => self.prog.globals[*g].addr_taken = true,
@@ -801,9 +809,12 @@ impl<'a> Parser<'a> {
         let mut char_cast = Vec::new();
         if !self.is_p(")") {
             loop {
-                let starts_with_cast = !self.iso_std && ft.variadic && args.len() >= ft.params.len() && self.is_p("(") && self.is_typename_tok(&self.peek_at(1).clone());
+                let starts_with_cast = ft.variadic && args.len() >= ft.params.len() && self.is_p("(") && self.is_typename_tok(&self.peek_at(1).clone());
                 let a = self.assign()?;
-                char_cast.push(starts_with_cast && a.ty.is_integer() && self.prog.size(&a.ty) == 1 && !a.ty.is_bool());
+                // An explicit cast suppresses the SDCC-specific promotion of the argument.
+                let char_arg = !self.iso_std && a.ty.is_integer() && self.prog.size(&a.ty) == 1 && !a.ty.is_bool();
+                let pinned_ptr = a.ty.space_var().map_or(false, |v| self.prog.spaces.is_pinned(v));
+                char_cast.push(starts_with_cast && (char_arg || pinned_ptr));
                 args.push(a);
                 if !self.eat_p(",") {
                     break;
@@ -827,6 +838,10 @@ impl<'a> Parser<'a> {
                     self.conv(a, &Type::new(TypeKind::Float))
                 } else if a.ty.is_integer() && !char_cast[i] {
                     self.promote(a)
+                } else if a.ty.is_pointer() && !a.ty.is_func_ptr() && !char_cast[i] {
+                    // Data pointers are passed as generic pointers unless explicitly cast (SDCC).
+                    let g = self.generic_ptr_to(a.ty.pointee().unwrap().clone());
+                    self.conv(a, &g)
                 } else {
                     a
                 };
@@ -1252,7 +1267,12 @@ impl<'a> Parser<'a> {
 
     /// Implicit conversion (no qualifier changes needed).
     pub(super) fn conv(&mut self, e: Expr, ty: &Type) -> Expr {
-        if e.ty.same(ty) && e.ty.is_signed() == ty.is_signed() && !e.ty.is_array() {
+        // Pointers in distinct space classes (pinned) need an explicit conversion.
+        let distinct_spaces = match (e.ty.space_var(), ty.space_var()) {
+            (Some(a), Some(b)) => self.prog.spaces.find_const(a) != self.prog.spaces.find_const(b),
+            _ => false,
+        };
+        if e.ty.same(ty) && e.ty.is_signed() == ty.is_signed() && !e.ty.is_array() && !distinct_spaces {
             if let (TypeKind::Enum(..), TypeKind::Int(..)) | (TypeKind::Int(..), TypeKind::Enum(..)) = (&e.ty.kind, &ty.kind) {
                 // fallthrough to relabel type
             } else {

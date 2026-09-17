@@ -249,6 +249,14 @@ pub fn eval_const(prog: &Program, e: &Expr) -> Option<ConstVal> {
                     if e.ty.is_float() {
                         let f = if inner.ty.is_signed() { i as f64 } else { i as u64 as f64 };
                         Some(ConstVal::Float(f))
+                    } else if e.ty.is_pointer() && !e.ty.is_func_ptr() && prog.size(&e.ty) == 3 && i & 0xffff != 0 && (inner.ty.is_integer() || prog.size(&inner.ty) == 2) {
+                        // Non-null constant converted to a generic pointer: add the space tag.
+                        let tag = if inner.ty.is_pointer() {
+                            prog.ptr_space(&inner.ty).map_or(0x40, |s| s.gptr_tag())
+                        } else {
+                            e.ty.pointee().and_then(|p| p.q.space).map_or(0x40, |s| s.gptr_tag())
+                        };
+                        Some(ConstVal::Int((i & 0xffff) | ((tag as i64) << 16)))
                     } else {
                         Some(ConstVal::Int(norm_int(i, &e.ty)))
                     }

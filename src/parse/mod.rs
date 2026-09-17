@@ -295,8 +295,10 @@ impl<'a> Parser<'a> {
     // Space inference helpers
 
     fn ptr_to(&mut self, t: Type) -> Type {
-        let sp = t.q.space.map(normalize_ptr_space);
-        let v = self.prog.spaces.new_var(sp);
+        let v = match t.q.space.map(normalize_ptr_space) {
+            Some(s) => self.prog.spaces.new_pinned(s),
+            None => self.prog.spaces.new_var(None),
+        };
         Type::new(TypeKind::Pointer(Rc::new(t), v))
     }
     fn ptr_to_in(&mut self, t: Type, space: Space) -> Type {

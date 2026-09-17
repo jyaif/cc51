@@ -246,6 +246,8 @@ pub struct SpaceSolver {
     pub solved: HashMap<u32, Option<Space>>,
     /// Variables known (from a previous pass) to be generic.
     pub generic_hint: std::collections::HashSet<u32>,
+    /// Variables of pointers declared with an explicit target space: never merged with other classes.
+    pub pinned: Vec<bool>,
 }
 
 impl SpaceSolver {
@@ -253,7 +255,17 @@ impl SpaceSolver {
         let id = self.parent.len() as u32;
         self.parent.push(id);
         self.spaces.push(s.into_iter().collect());
+        self.pinned.push(false);
         id
+    }
+    pub fn is_pinned(&self, v: SpaceVar) -> bool {
+        self.pinned[self.find_const(v) as usize]
+    }
+    /// A variable fixed to one space (explicitly declared).
+    pub fn new_pinned(&mut self, s: Space) -> SpaceVar {
+        let v = self.new_var(Some(s));
+        self.pinned[v as usize] = true;
+        v
     }
     pub fn find(&mut self, v: SpaceVar) -> SpaceVar {
         let mut r = v;
@@ -280,6 +292,20 @@ impl SpaceSolver {
         if ra == rb {
             return;
         }
+        // A pinned class keeps its space; the other class must be able to hold it.
+        match (self.pinned[ra as usize], self.pinned[rb as usize]) {
+            (true, true) => return,
+            (true, false) | (false, true) => {
+                let (p, o) = if self.pinned[ra as usize] { (ra, rb) } else { (rb, ra) };
+                for s in self.spaces[p as usize].clone() {
+                    if !self.spaces[o as usize].contains(&s) {
+                        self.spaces[o as usize].push(s);
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
         let sb = std::mem::take(&mut self.spaces[rb as usize]);
         for s in sb {
             if !self.spaces[ra as usize].contains(&s) {
@@ -291,6 +317,9 @@ impl SpaceSolver {
     pub fn add_space(&mut self, v: SpaceVar, s: Space) {
         let r = self.find(v);
         let s = normalize_ptr_space(s);
+        if self.pinned[r as usize] {
+            return;
+        }
         if !self.spaces[r as usize].contains(&s) {
             self.spaces[r as usize].push(s);
         }
@@ -526,6 +555,11 @@ pub fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
 }
 
 impl Program {
+    /// Data pointers passed as variable arguments are generic unless their target space is explicit.
+    pub fn is_generic_vararg_ptr(&self, t: &Type) -> bool {
+        t.is_pointer() && !t.is_func_ptr() && t.space_var().map_or(false, |v| self.spaces.is_generic(v))
+    }
+
     /// Size of the variable-argument area needed by each variadic function.
     pub fn vararg_sizes(&self) -> Vec<u32> {
         let mut sizes = vec![0u32; self.funcs.len()];
@@ -546,7 +580,7 @@ impl Program {
                         if ft.variadic && args.len() > ft.params.len() {
                             let n: u32 = args[ft.params.len()..]
                                 .iter()
-                                .map(|a| if a.ty.is_array() || (a.ty.is_pointer() && !a.ty.is_func_ptr()) { 3 } else if a.ty.is_bit() { 1 } else { self.size(&a.ty) })
+                                .map(|a| if a.ty.is_array() || self.is_generic_vararg_ptr(&a.ty) { 3 } else if a.ty.is_bit() { 1 } else { self.size(&a.ty) })
                                 .sum();
                             sizes[fid] = sizes[fid].max(n);
                         }
