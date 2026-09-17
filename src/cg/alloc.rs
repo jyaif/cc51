@@ -176,8 +176,31 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
             // Clobber constraints for values live across the instruction.
             let clob = inst_clobbers(f, ins, cx.callee);
             if clob != 0 {
+                // A value passed in a parameter register that the callee does not write survives the call.
+                let mut keep_for: Vec<(usize, u8)> = Vec::new();
+                if let Inst::Call(_, c, args) = ins {
+                    let s = (cx.callee)(c);
+                    for (i, a) in args.iter().enumerate() {
+                        if let (Val::R(r), Some(pl)) = (a, s.params.get(i)) {
+                            if pl.len() == 1 && f.ty(*r) == Ty::I8 {
+                                if let Loc::R(pr) = pl[0] {
+                                    let used_by_other = s.params.iter().enumerate().any(|(j, q)| j != i && q.contains(&Loc::R(pr)));
+                                    if s.clobbers & (1 << pr) == 0 && !used_by_other && !s.ret.contains(&Loc::R(pr)) {
+                                        keep_for.push((*r as usize, pr));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 for x in l.iter() {
-                    forbid[x] |= clob;
+                    let mut m = clob;
+                    for &(v, pr) in &keep_for {
+                        if v == x {
+                            m &= !(1 << pr);
+                        }
+                    }
+                    forbid[x] |= m;
                 }
             }
             if let Inst::Call(dst, c, args) = ins {
