@@ -90,33 +90,8 @@ fn helper_summary(name: &str) -> Summary {
 
 /// Fixed calling convention (address-taken functions).
 fn fixed_convention(f: &Func) -> (Vec<Vec<Loc>>, Vec<Loc>) {
-    let order = [7u8, 6, 5, 4, 3, 2];
-    let mut k = 0usize;
-    let mut slot = 0u16;
-    let mut params = Vec::new();
-    for (i, p) in f.params.iter().enumerate() {
-        match p {
-            ParamLoc::Reg(_) => {
-                let n = if f.param_tys[i] == Ty::Bit { 1 } else { f.param_tys[i].bytes() };
-                let mut v = Vec::new();
-                for _ in 0..n {
-                    if f.param_tys[i] == Ty::Bit {
-                        v.push(Loc::BitSlot(f.id, slot));
-                        slot += 1;
-                    } else if k < order.len() {
-                        v.push(Loc::R(order[k]));
-                        k += 1;
-                    } else {
-                        v.push(Loc::Slot(f.id, slot));
-                        slot += 1;
-                    }
-                }
-                params.push(v);
-            }
-            ParamLoc::Frame(_) => params.push(vec![]),
-        }
-    }
-    (params, ret_convention(f.ret))
+    let tys: Vec<Option<Ty>> = f.params.iter().enumerate().map(|(i, p)| matches!(p, ParamLoc::Reg(_)).then(|| f.param_tys[i])).collect();
+    (super::fixed_param_locs(&tys), ret_convention(f.ret))
 }
 
 fn ret_convention(ret: Option<Ty>) -> Vec<Loc> {
@@ -297,6 +272,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     let param_tys = |c: &Callee| -> Option<Vec<Ty>> {
         match c {
             Callee::Direct(f) => Some(ptys[*f].clone()),
+            Callee::Indirect(_, t) => Some(t.to_vec()),
             _ => None,
         }
     };
@@ -364,7 +340,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
                                 Inst::Call(_, Callee::Runtime(n), _) => {
                                     runtime_used.insert(n.to_string());
                                 }
-                                Inst::Call(_, Callee::Indirect(_), _) => {
+                                Inst::Call(_, Callee::Indirect(..), _) => {
                                     runtime_used.insert("__call_dptr".into());
                                 }
                                 Inst::Asm(t) => {
@@ -461,7 +437,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
                             }
                         }
                     }
-                    Inst::Call(_, Callee::Indirect(_), _) => has_indirect[i] = true,
+                    Inst::Call(_, Callee::Indirect(..), _) => has_indirect[i] = true,
                     _ => {}
                 }
             }
@@ -575,6 +551,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
         }
     }
     let mut codes: Vec<(usize, Vec<Item>)> = Vec::new();
+    let (mut iargs_bytes, mut iargs_bits) = (0u32, 0u16);
     let mut frames: Vec<FrameReq> = vec![FrameReq::default(); n];
     let mut total_clobbers: Vec<RegSet> = vec![0; prog.funcs.len()];
     // Transitive use of B / DPTR (for interrupt context saving).
@@ -598,7 +575,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
                     let (p, r) = (vec![], vec![ACC]);
                     Summary { params: p, ret: r, clobbers: ALL_REGS, keeps_b: false, keeps_dptr: false }
                 }),
-                Callee::Indirect(_) => {
+                Callee::Indirect(..) => {
                     // Callee must use the fixed convention; take any address-taken function's shape: computed per call.
                     Summary { params: vec![], ret: vec![], clobbers: ALL_REGS, keeps_b: false, keeps_dptr: false }
                 }
@@ -689,14 +666,14 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
         let callee_sym = |c: &Callee| -> Rc<str> {
             match c {
                 Callee::Direct(x) => fnames[*x].clone(),
-                Callee::Indirect(_) => "__call_dptr".into(),
+                Callee::Indirect(..) => "__call_dptr".into(),
                 Callee::Runtime(n) => (*n).into(),
             }
         };
         // Indirect calls need per-call summaries: wrap the callee function.
         let call_sum = |c: &Callee| -> Summary {
             match c {
-                Callee::Indirect(_) => Summary { params: vec![], ret: vec![], clobbers: ALL_REGS, keeps_b: false, keeps_dptr: false },
+                Callee::Indirect(..) => Summary { params: vec![], ret: vec![], clobbers: ALL_REGS, keeps_b: false, keeps_dptr: false },
                 _ => callee_summary(c),
             }
         };
@@ -706,7 +683,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
             match c {
                 Callee::Direct(x) => is_rec && index.get(x).map_or(false, |&j| scc_id[j] == my_scc),
                 // An indirect call may reach any address-taken function, including this one.
-                Callee::Indirect(_) => is_rec,
+                Callee::Indirect(..) => is_rec,
                 _ => false,
             }
         };
@@ -853,15 +830,22 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
                 fr.objects.push(RamObj { sym: frame_obj_sym(fid, 1000 + pi as u32), size: t.bytes(), upper: false });
             }
         }
-        let mut nslots = al.nslots;
-        let mut nbits = al.nbits;
-        if let Some((p, _)) = &fixed {
-            for l in p.iter().flatten() {
-                match l {
-                    Loc::Slot(_, s) => nslots = nslots.max(s + 1),
-                    Loc::BitSlot(_, s) => nbits = nbits.max(s + 1),
-                    _ => {}
+        let (nslots, nbits) = (al.nslots, al.nbits);
+        // Shared argument area used by this function's convention and its indirect calls.
+        let mut shared: Vec<Loc> = fixed.as_ref().map(|x| x.0.concat()).unwrap_or_default();
+        for b in &f.blocks {
+            for ins in &b.insts {
+                if let Inst::Call(_, Callee::Indirect(_, tys), _) = ins {
+                    let tys: Vec<Option<Ty>> = tys.iter().map(|t| Some(*t)).collect();
+                    shared.extend(super::fixed_param_locs(&tys).concat());
                 }
+            }
+        }
+        for l in shared {
+            match l {
+                Loc::Obj(super::IARGS, _, o) => iargs_bytes = iargs_bytes.max(o as u32 + 1),
+                Loc::BitSlot(super::IARGS, s) => iargs_bits = iargs_bits.max(s + 1),
+                _ => {}
             }
         }
         fr.slots = (0..nslots).map(|s| slot_sym(fid, s)).collect();
@@ -871,7 +855,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     }
 
     // ---- RAM layout ----
-    let mut global_bits = Vec::new();
+    let mut global_bits: Vec<Rc<str>> = (0..iargs_bits).map(|n| super::bit_slot_sym(super::IARGS, n)).collect();
     let mut ram_globals = Vec::new();
     let mut xdata_globals = Vec::new();
     let mut code_globals = Vec::new();
@@ -898,7 +882,10 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     }
     // Initialized globals first so that zero-initialized ones form a contiguous block to clear.
     ram_globals.sort_by_key(|g| prog.globals[*g].init.as_ref().map_or(1, |i| if i.bytes.iter().all(|b| *b == 0) && i.relocs.is_empty() { 1 } else { 0 }));
-    let mut globals_req: Vec<RamObj> = ram_globals.iter().map(|&g| RamObj { sym: gnames[g].clone(), size: prog.size(&prog.globals[g].ty).max(1), upper: idata_globals.contains(&g) }).collect();
+    let mut globals_req: Vec<RamObj> = ram_globals.iter().map(|&g| RamObj { sym: gnames[g].clone(), size: prog.global_size(g).max(1), upper: idata_globals.contains(&g) }).collect();
+    if iargs_bytes > 0 {
+        globals_req.push(RamObj { sym: super::frame_obj_sym(super::IARGS, 0), size: iargs_bytes, upper: false });
+    }
     // Runtime scratch RAM.
     let rt_mods = runtime_modules();
     let mut rt_needed: Vec<usize> = Vec::new();
@@ -1008,7 +995,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     let mut xptr = opts.xram_start;
     for &g in &xdata_globals {
         syms.insert(gnames[g].clone(), xptr as i64);
-        xptr += prog.size(&prog.globals[g].ty).max(1);
+        xptr += prog.global_size(g).max(1);
     }
     if xptr > opts.xram_start + opts.xram_size {
         return Err("external RAM exhausted".into());
@@ -1118,7 +1105,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     // Xdata init.
     for &g in &xdata_globals {
         let gl = &prog.globals[g];
-        let size = prog.size(&gl.ty);
+        let size = prog.global_size(g);
         let bytes = gl.init.as_ref().map(|i| i.bytes.clone()).unwrap_or_else(|| vec![0; size as usize]);
         start.push(Item::Insn(crate::asm::Insn::new(Mn::Mov, vec![Op::Dptr, Op::Imm(Expr::sym(&gnames[g]))])));
         for (k, b) in bytes.iter().enumerate() {
@@ -1173,7 +1160,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     // Constant data in code space.
     for &g in &code_globals {
         let gl = &prog.globals[g];
-        let size = prog.size(&gl.ty);
+        let size = prog.global_size(g);
         let mut items = vec![Item::Label(gnames[g].clone())];
         let init = gl.init.clone().unwrap_or_default();
         let mut bytes: Vec<Expr> = (0..size as usize).map(|k| Expr::num(*init.bytes.get(k).unwrap_or(&0) as i64)).collect();

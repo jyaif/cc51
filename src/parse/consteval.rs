@@ -115,6 +115,9 @@ impl<'a> Parser<'a> {
             match &it.kind {
                 super::init::InitKind::Bytes(b) => {
                     let off = it.offset as usize;
+                    if off + b.len() > data.bytes.len() && off >= size as usize {
+                        data.bytes.resize(off + b.len(), 0);
+                    }
                     for (i, x) in b.iter().enumerate() {
                         if off + i < data.bytes.len() {
                             data.bytes[off + i] = *x;
@@ -124,6 +127,10 @@ impl<'a> Parser<'a> {
                 super::init::InitKind::Expr(e) => {
                     let esize = if e.ty.is_bit() { 1 } else { self.prog.size(&e.ty) } as usize;
                     let off = it.offset as usize;
+                    if off + esize > data.bytes.len() {
+                        // Flexible array member initializer.
+                        data.bytes.resize(off + esize, 0);
+                    }
                     if e.ty.is_record() {
                         // Copy of a constant aggregate: only compound literals / globals with init.
                         let src = match &e.kind {

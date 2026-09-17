@@ -54,10 +54,52 @@ pub fn slot_sym(f: FuncId, n: u16) -> Rc<str> {
     format!("__s{}_{}", f, n).into()
 }
 pub fn bit_slot_sym(f: FuncId, n: u16) -> Rc<str> {
+    if f == IARGS {
+        return format!("__iargb{}", n).into();
+    }
     format!("__b{}_{}", f, n).into()
 }
 pub fn frame_obj_sym(f: FuncId, n: u32) -> Rc<str> {
+    if f == IARGS {
+        return "__iargs".into();
+    }
     format!("__o{}_{}", f, n).into()
+}
+
+/// Pseudo function owning the shared argument area of fixed-convention calls
+/// (arguments beyond the registers, and bit arguments).
+pub const IARGS: FuncId = usize::MAX;
+
+/// Parameter locations of the fixed calling convention (address-taken and recursive functions,
+/// and calls through pointers). `None` marks a parameter passed in the callee's frame.
+pub fn fixed_param_locs(tys: &[Option<crate::ir::Ty>]) -> Vec<Vec<Loc>> {
+    use crate::ir::Ty;
+    let order = [7u8, 6, 5, 4, 3, 2];
+    let (mut k, mut off, mut bit) = (0usize, 0u16, 0u16);
+    let mut params = Vec::new();
+    for t in tys {
+        let mut v = Vec::new();
+        match t {
+            None => {}
+            Some(Ty::Bit) => {
+                v.push(Loc::BitSlot(IARGS, bit));
+                bit += 1;
+            }
+            Some(t) => {
+                for _ in 0..t.bytes() {
+                    if k < order.len() {
+                        v.push(Loc::R(order[k]));
+                        k += 1;
+                    } else {
+                        v.push(Loc::Obj(IARGS, 0, off));
+                        off += 1;
+                    }
+                }
+            }
+        }
+        params.push(v);
+    }
+    params
 }
 
 thread_local! {

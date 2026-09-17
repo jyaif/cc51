@@ -152,7 +152,7 @@ pub fn demanded(f: &Func, param_tys: &dyn Fn(&Callee) -> Option<Vec<Ty>>) -> Vec
                         add(&mut dem, v, width_mask(*ty));
                     }
                     Inst::Call(_, c, args) => {
-                        if let Callee::Indirect(t) = c {
+                        if let Callee::Indirect(t, _) = c {
                             add(&mut dem, t, 0xffff);
                         }
                         let pt = param_tys(c);
@@ -408,7 +408,7 @@ fn fixup_inst(f: &mut Func, ins: &mut Inst, out: &mut Vec<Inst>, old_ty: &[Ty], 
             *v = conv(f, *v, t, out, false);
         }
         Inst::Call(_, c, args) => {
-            if let Callee::Indirect(t) = c {
+            if let Callee::Indirect(t, _) = c {
                 *t = conv(f, *t, Ty::I16, out, false);
             }
             let pts = param_tys(c);

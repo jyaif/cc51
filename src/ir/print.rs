@@ -53,7 +53,7 @@ pub fn inst(f: &Func, i: &Inst) -> String {
             }
             match c {
                 Callee::Direct(fid) => write!(s, "call f{}", fid).unwrap(),
-                Callee::Indirect(v) => write!(s, "call *{}", val(f, v)).unwrap(),
+                Callee::Indirect(v, _) => write!(s, "call *{}", val(f, v)).unwrap(),
                 Callee::Runtime(n) => write!(s, "call {}", n).unwrap(),
             }
             let a: Vec<String> = args.iter().map(|a| val(f, a)).collect();

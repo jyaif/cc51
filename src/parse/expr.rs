@@ -797,9 +797,13 @@ impl<'a> Parser<'a> {
             return err(loc, format!("called object type '{}' is not a function or function pointer", callee.ty));
         };
         let mut args = Vec::new();
+        // Variadic arguments explicitly cast to a char type are passed unpromoted (SDCC).
+        let mut char_cast = Vec::new();
         if !self.is_p(")") {
             loop {
+                let starts_with_cast = ft.variadic && args.len() >= ft.params.len() && self.is_p("(") && self.is_typename_tok(&self.peek_at(1).clone());
                 let a = self.assign()?;
+                char_cast.push(starts_with_cast && a.ty.is_integer() && self.prog.size(&a.ty) == 1 && !a.ty.is_bool());
                 args.push(a);
                 if !self.eat_p(",") {
                     break;
@@ -819,7 +823,13 @@ impl<'a> Parser<'a> {
                 out.push(self.assign_conv(a, &pt, loc)?);
             } else {
                 let a = self.rval(a);
-                let a = if a.ty.is_float() { self.conv(a, &Type::new(TypeKind::Float)) } else if a.ty.is_integer() { self.promote(a) } else { a };
+                let a = if a.ty.is_float() {
+                    self.conv(a, &Type::new(TypeKind::Float))
+                } else if a.ty.is_integer() && !char_cast[i] {
+                    self.promote(a)
+                } else {
+                    a
+                };
                 out.push(a);
             }
         }

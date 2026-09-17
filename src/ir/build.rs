@@ -16,8 +16,8 @@ enum Storage {
 enum LVal {
     Reg(VReg),
     Mem(Mem, Ty),
-    /// Bit-field inside memory: (mem of first storage byte, bit offset, width, signed)
-    Bits(Mem, u8, u8, bool),
+    /// Bit-field inside memory: (mem of first storage byte, bit offset, width, value type if signed)
+    Bits(Mem, u8, u8, Option<Ty>),
     /// 16/32-bit SFR composed of separate byte addresses (little-endian order).
     SfrMulti(Vec<u32>),
 }
@@ -318,7 +318,7 @@ impl<'a> Builder<'a> {
                 let TypeKind::Record(rid) = b.ty.kind else { return err(e.loc, "member of non-record") };
                 let f = &self.prog.records[rid].fields[*fi];
                 let (off, bits) = (f.offset, f.bits);
-                let signed = f.ty.is_signed();
+                let signed = if f.ty.is_signed() && !f.ty.is_bool() { Some(self.ty(&f.ty)) } else { None };
                 let base = self.lvalue(b)?;
                 let m = match base {
                     LVal::Mem(m, _) => m,
@@ -326,7 +326,7 @@ impl<'a> Builder<'a> {
                 };
                 let m = mem_add(m, off as i32);
                 if let Some((bo, w)) = bits {
-                    return Ok(LVal::Bits(m, bo, w, signed && !f.ty.is_bool()));
+                    return Ok(LVal::Bits(m, bo, w, signed));
                 }
                 Ok(LVal::Mem(m, ety))
             }
@@ -447,8 +447,8 @@ impl<'a> Builder<'a> {
                 let t = self.tmp(sty);
                 self.emit(Inst::Bin(BinK::And, t, v, Val::K(mask)));
                 v = Val::R(t);
-                if *signed {
-                    // Sign-extend from w bits.
+                if let Some(vty) = *signed {
+                    // Sign-extend from w bits, then to the field's type.
                     let sh = sty.bits() as i64 - *w as i64;
                     if sh > 0 {
                         let t1 = self.tmp(sty);
@@ -456,6 +456,11 @@ impl<'a> Builder<'a> {
                         let t2 = self.tmp(sty);
                         self.emit(Inst::Bin(BinK::ShrS, t2, Val::R(t1), Val::K(sh)));
                         v = Val::R(t2);
+                    }
+                    if vty.bits() > sty.bits() {
+                        let t = self.tmp(vty);
+                        self.emit(Inst::Ext(t, v, true));
+                        v = Val::R(t);
                     }
                 }
                 v
@@ -886,12 +891,14 @@ impl<'a> Builder<'a> {
                 // Keep the stored value in a vreg only if needed later (the optimizer removes the copy otherwise).
                 self.store(&lv, v);
                 if let LVal::Bits(_, _, w, signed) = lv {
+                    if signed.is_some() {
+                        return Ok(self.load(&lv));
+                    }
                     // The value of the assignment is the truncated bit-field value.
                     let vt = self.val_ty(v, ty);
                     let mask = if w as u32 >= vt.bits() { vt.mask() as i64 } else { (1i64 << w) - 1 };
                     let t = self.tmp(vt);
                     self.emit(Inst::Bin(BinK::And, t, v, Val::K(mask)));
-                    let _ = signed;
                     return Ok(Val::R(t));
                 }
                 Ok(v)
@@ -1197,11 +1204,15 @@ impl<'a> Builder<'a> {
                         let fft = self.prog.funcs[fid].ftype().clone();
                         (Callee::Direct(fid), Some(fft.params.clone()))
                     }
-                    _ => (Callee::Indirect(v), None),
+                    _ => (Callee::Indirect(v, Rc::from(Vec::new())), None),
                 }
             }
         };
         let params = def_params.unwrap_or_else(|| ft.params.clone());
+        let target = match target {
+            Callee::Indirect(v, _) => Callee::Indirect(v, params.iter().map(|t| if t.is_scalar() { self.ty(t) } else { Ty::I16 }).collect()),
+            t => t,
+        };
         let variadic_extra = args.len() > params.len();
         // Evaluate variable arguments first; they are stored after all arguments are evaluated.
         let mut var_vals: Vec<(Val, Ty)> = Vec::new();
@@ -1575,7 +1586,7 @@ impl<'a> Builder<'a> {
                             let m = mem_add(base, *off as i32);
                             let ety = self.ty(&e.ty);
                             let lv = match bits {
-                                Some((bo, w)) => LVal::Bits(m, *bo, *w, false),
+                                Some((bo, w)) => LVal::Bits(m, *bo, *w, None),
                                 None => LVal::Mem(m, ety),
                             };
                             self.store(&lv, v);

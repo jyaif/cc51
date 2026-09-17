@@ -270,6 +270,15 @@ pub fn propagate(f: &mut Func) -> bool {
         let mut copies: Vec<(VReg, Val)> = Vec::new();
         let ninst = f.blocks[bi].insts.len();
         for ii in 0..ninst {
+            // Extension of a constant: fold using the source width (the Ext itself can't know it).
+            if let Inst::Ext(d, Val::R(r), sg) = f.blocks[bi].insts[ii] {
+                if let Some((_, Val::K(k))) = copies.iter().find(|c| c.0 == r) {
+                    let (st, dt) = (f.ty(r), f.ty(d));
+                    let v = if sg && st != Ty::Bit { dt.norm(st.sext(*k)) } else { dt.norm(st.norm(*k)) };
+                    f.blocks[bi].insts[ii] = Inst::Copy(d, Val::K(v));
+                    changed = true;
+                }
+            }
             let ins = &mut f.blocks[bi].insts[ii];
             ins.for_each_val_mut(|v| {
                 if let Val::R(r) = v {

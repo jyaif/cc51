@@ -427,6 +427,12 @@ impl Program {
         self.sizeof(t).unwrap_or(0)
     }
 
+    /// Storage size of a global (a flexible array member may extend past the type's size).
+    pub fn global_size(&self, g: usize) -> u32 {
+        let gl = &self.globals[g];
+        self.size(&gl.ty).max(gl.init.as_ref().map_or(0, |i| i.bytes.len() as u32))
+    }
+
     /// The pointer target space (None for generic pointers).
     pub fn ptr_space(&self, t: &Type) -> Option<Space> {
         match &t.kind {

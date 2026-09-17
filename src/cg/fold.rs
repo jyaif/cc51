@@ -76,7 +76,7 @@ impl<'a> Ctx<'a> {
         let def = self.f.blocks[b as usize].insts[*cursor - 1].clone();
         let ok = match role {
             Role::Leaf => match &def {
-                Inst::Load(_, m) => direct_mem(m) && (self.mem_space)(m) != Some(Space::Idata) && !mem_is_volatile(m) && ty != Ty::Bit,
+                Inst::Load(_, m) => direct_mem(m) && !matches!((self.mem_space)(m), Some(Space::Idata | Space::Code | Space::Xdata | Space::Pdata)) && !mem_is_volatile(m) && ty != Ty::Bit,
                 _ => false,
             },
             Role::Acc => {

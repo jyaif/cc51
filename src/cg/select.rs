@@ -1333,7 +1333,10 @@ impl<'a> Gen<'a> {
         let Mem::Ptr(p, o, _) = m else {
             // Direct symbol in idata above 0x80 etc.
             let busy = self.busy_regs(extra_busy);
-            let r = self.pick_ptr_reg(busy).expect("no free pointer register");
+            let r = match self.pick_ptr_reg(busy) {
+                Some(r) => r,
+                None => self.borrow_rptr(extra_busy, None),
+            };
             let e = match m {
                 Mem::Sym(s, so) => self.addr_expr(s, so + k),
                 Mem::Abs(_, a) => Expr::num(*a as i64 + k as i64),
@@ -1367,33 +1370,7 @@ impl<'a> Gen<'a> {
         }
         let r = match self.pick_ptr_reg(busy) {
             Some(r) => r,
-            None => {
-                // Last resort: borrow a pointer register (not holding an operand) around the access.
-                let extra_regs = {
-                    let mut m: RegSet = 0;
-                    for v in extra_busy {
-                        if let Val::R(x) = v {
-                            for l in self.al.locs.get(*x as usize).map(|v| v.as_slice()).unwrap_or(&[]) {
-                                if let Loc::R(q) = l {
-                                    m |= 1 << q;
-                                }
-                            }
-                        }
-                    }
-                    if let Val::R(pr) = p {
-                        for l in self.al.locs.get(*pr as usize).map(|v| v.as_slice()).unwrap_or(&[]) {
-                            if let Loc::R(q) = l {
-                                m |= 1 << q;
-                            }
-                        }
-                    }
-                    m
-                };
-                let r = [1u8, 0].into_iter().find(|r| extra_regs & (1 << r) == 0).expect("no pointer register can be borrowed");
-                self.e1(Mn::Push, Op::dir((self.bank * 8 + r) as i64));
-                self.pending_pop = Some(r);
-                r
-            }
+            None => self.borrow_rptr(extra_busy, Some(p)),
         };
         self.scratch |= 1 << r;
         match p {
@@ -1446,6 +1423,24 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        r
+    }
+
+    /// Last resort: borrow a pointer register (not holding an operand) around the access.
+    fn borrow_rptr(&mut self, extra_busy: &[Val], p: Option<&Val>) -> u8 {
+        let mut m: RegSet = 0;
+        for v in extra_busy.iter().chain(p) {
+            if let Val::R(x) = v {
+                for l in self.al.locs.get(*x as usize).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    if let Loc::R(q) = l {
+                        m |= 1 << q;
+                    }
+                }
+            }
+        }
+        let r = [1u8, 0].into_iter().find(|r| m & (1 << r) == 0).expect("no pointer register can be borrowed");
+        self.e1(Mn::Push, Op::dir((self.bank * 8 + r) as i64));
+        self.pending_pop = Some(r);
         r
     }
 
@@ -1630,22 +1625,40 @@ impl<'a> Gen<'a> {
             PSpace::S(Space::Data | Space::Idata) if n > 1 => {
                 // Sequential bytes through @Ri (the pointer register must not be a destination).
                 let busy_extra: Vec<Val> = vec![Val::R(d)];
-                let r = self.set_rptr(m, 0, &busy_extra);
+                let dest_ptr = [1u8, 0].into_iter().find(|r| dl.contains(&Loc::R(*r)));
+                let r = match (m, dest_ptr) {
+                    (Mem::Sym(sy, so), Some(r)) if self.pick_ptr_reg(self.busy_regs(&busy_extra)).is_none() => {
+                        // Point with a destination register (its byte is held in B).
+                        let e = self.addr_expr(sy, *so);
+                        self.set_reg_imm(r, e);
+                        self.scratch |= 1 << r;
+                        r
+                    }
+                    _ => self.set_rptr(m, 0, &busy_extra),
+                };
+                // The (dead) base register may also receive one byte: hold that byte in B until the end.
                 let base_is_dest = dl.iter().any(|l| *l == Loc::R(r));
-                assert!(!base_is_dest, "pointer register overlaps destination");
                 for k in 0..n {
                     if k > 0 {
                         self.e1(Mn::Inc, Op::R(r));
                     }
                     let dk = dl[k as usize];
-                    if dk.is_reg() {
+                    if dk == Loc::R(r) {
+                        self.e2(Mn::Mov, Op::A, Op::AtR(r));
+                        self.e2(Mn::Mov, Op::dir(B_DIR), Op::A);
+                        self.uses_b = true;
+                    } else if dk.is_reg() {
                         self.e2(Mn::Mov, Op::A, Op::AtR(r));
                         self.store_a(dk);
                     } else {
                         self.e2(Mn::Mov, loc_op(dk), Op::AtR(r));
                     }
                 }
-                self.restore_rptr(m, r, n - 1);
+                if base_is_dest {
+                    self.e2(Mn::Mov, Op::R(r), Op::dir(B_DIR));
+                } else {
+                    self.restore_rptr(m, r, n - 1);
+                }
                 self.release_rptr();
             }
             PSpace::S(Space::Xdata | Space::Pdata) if n > 1 => {
@@ -1825,6 +1838,8 @@ impl<'a> Gen<'a> {
                     self.st = State::default();
                 }
             }
+            // Writes to code space have no effect.
+            PSpace::S(Space::Code) => {}
             PSpace::S(s) => panic!("store to space {:?} in {}", s, self.f.name),
         }
     }
@@ -2002,6 +2017,26 @@ impl<'a> Gen<'a> {
             }
             // C = (a >= k): inverted sense.
             return true;
+        }
+        if n == 1 {
+            if let sb @ Src::Tree(_) = self.src(b, 0) {
+                // Operands were swapped (a <= b as b >= a): evaluate the tree into B first.
+                self.load_a(&sb);
+                if signed {
+                    self.e2(Mn::Xrl, Op::A, Op::imm(0x80));
+                }
+                self.e2(Mn::Mov, Op::dir(B_DIR), Op::A);
+                self.uses_b = true;
+                let sa = self.src(a, 0);
+                self.load_a(&sa);
+                if signed {
+                    self.e2(Mn::Xrl, Op::A, Op::imm(0x80));
+                }
+                let l = self.new_label();
+                self.cjne_a(Op::dir(B_DIR), &l);
+                self.place_label(l, false);
+                return false;
+            }
         }
         if signed {
             // Compare with xor 0x80 on the top bytes using B for b's top byte.
@@ -2740,21 +2775,9 @@ impl<'a> Gen<'a> {
         self.st = State::default();
     }
 
-    fn indirect_summary(&self, args: &[Val], ret: Option<Ty>) -> Summary {
-        let order = [7u8, 6, 5, 4, 3, 2];
-        let mut k = 0;
-        let mut params = Vec::new();
-        for a in args {
-            let t = self.vty(*a, Ty::I16);
-            let mut v = Vec::new();
-            for _ in 0..t.bytes() {
-                if k < order.len() {
-                    v.push(Loc::R(order[k]));
-                    k += 1;
-                }
-            }
-            params.push(v);
-        }
+    fn indirect_summary(&self, args: &[Val], tys: &[Ty], ret: Option<Ty>) -> Summary {
+        let tys: Vec<Option<Ty>> = args.iter().enumerate().map(|(i, a)| Some(tys.get(i).copied().unwrap_or_else(|| self.vty(*a, Ty::I16)))).collect();
+        let params = super::fixed_param_locs(&tys);
         let ret = match ret {
             None => vec![],
             Some(Ty::Bit) => vec![CARRY],
@@ -2775,12 +2798,12 @@ impl<'a> Gen<'a> {
 
     fn gen_call_ty(&mut self, dst: Option<Vec<Loc>>, c: &Callee, args: &[Val], ret_ty: Option<Ty>) -> Summary {
         let s = match c {
-            Callee::Indirect(_) => self.indirect_summary(args, ret_ty),
+            Callee::Indirect(_, tys) => self.indirect_summary(args, tys, ret_ty),
             _ => (self.cx.callee)(c),
         };
         let mut moves: Vec<(Loc, Src)> = Vec::new();
         // Indirect target into DPTR first.
-        if let Callee::Indirect(t) = c {
+        if let Callee::Indirect(t, _) = c {
             match t {
                 Val::Addr(sym, o) => {
                     let e = self.addr_expr(sym, *o);

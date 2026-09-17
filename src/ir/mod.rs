@@ -255,7 +255,8 @@ impl Mem {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Callee {
     Direct(FuncId),
-    Indirect(Val),
+    /// Call through a pointer; the parameter types come from the pointer's function type.
+    Indirect(Val, std::rc::Rc<[Ty]>),
     /// Runtime helper.
     Runtime(&'static str),
 }
@@ -333,7 +334,7 @@ impl Inst {
                 f(v)
             }
             Inst::Call(_, c, args) => {
-                if let Callee::Indirect(v) = c {
+                if let Callee::Indirect(v, _) = c {
                     f(v)
                 }
                 for a in args {
@@ -370,7 +371,7 @@ impl Inst {
                 f(v)
             }
             Inst::Call(_, c, args) => {
-                if let Callee::Indirect(v) = c {
+                if let Callee::Indirect(v, _) = c {
                     f(v)
                 }
                 for a in args {
