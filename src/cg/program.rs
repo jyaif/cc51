@@ -987,7 +987,8 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
     }
     let code_origin = (opts.code_start + 3).max(max_vec);
     sections.push(Section { name: "startup".into(), items: start, org: Some(code_origin) });
-    // Functions in a stable order: main first, then the rest in call-graph pre-order.
+    let nfixed = sections.len();
+    // Functions: main first, then the rest (the order is optimized below).
     let mut order_codes: Vec<(usize, Vec<Item>)> = codes;
     order_codes.sort_by_key(|(fid, _)| if *fid == main_fid { 0 } else { 1 });
     for (fid, items) in order_codes {
@@ -1030,7 +1031,14 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         items.push(Item::Db(bytes));
         sections.push(Section { name: gnames[g].clone(), items, org: None });
     }
+    let nmovable = sections.len() - nfixed;
     let code_end = opts.code_start + opts.code_size;
+    // Order movable sections (functions and runtime) to maximize short calls and jumps.
+    let sections = if opts.opt > 0 && nmovable > 1 {
+        order_sections(sections, nfixed, nmovable, &syms, code_origin)
+    } else {
+        sections
+    };
     let lk = link::link(sections, syms, code_origin, code_end)?;
     let ranges: Vec<(u32, u32)> = lk.sections.iter().map(|(_, a, s)| (*a, *a + *s)).collect();
     let hex = link::intel_hex(&lk.image, &ranges);
@@ -1054,6 +1062,90 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         let _ = writeln!(map, "  {:#04x} {}", v, k);
     }
     Ok(Output { image: lk.image, hex, listing: lk.listing, map, code_size, ram_used: lay.ram_end })
+}
+
+/// Search for a section order that minimizes code size.
+fn order_sections(sections: Vec<Section>, nfixed: usize, nmovable: usize, syms: &HashMap<Rc<str>, i64>, origin: u32) -> Vec<Section> {
+    let total = sections.len();
+    let fixed: Vec<usize> = (0..nfixed).collect();
+    let tail: Vec<usize> = (nfixed + nmovable..total).collect();
+    let movable: Vec<usize> = (nfixed..nfixed + nmovable).collect();
+    let eval = |m: &[usize]| -> u32 {
+        let order: Vec<usize> = fixed.iter().chain(m.iter()).chain(tail.iter()).copied().collect();
+        link::measure(&sections, &order, syms, origin).unwrap_or(u32::MAX)
+    };
+    // Call counts per section label.
+    let mut calls: HashMap<Rc<str>, u32> = HashMap::new();
+    for s in &sections {
+        for it in &s.items {
+            if let Item::Insn(i) = it {
+                if matches!(i.mn, Mn::Call | Mn::Jmp) {
+                    if let Some(t) = i.target().and_then(|t| t.sym.clone()) {
+                        *calls.entry(t).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+    let size_of = |i: usize| -> u32 { sections[i].items.iter().map(|it| if let Item::Insn(x) = it { crate::asm::insn_size(x, crate::asm::Reach::Short) } else { 0 }).sum() };
+    let heat = |i: usize| -> u32 {
+        let first_label = sections[i].items.iter().find_map(|it| if let Item::Label(l) = it { Some(l.clone()) } else { None });
+        first_label.and_then(|l| calls.get(&l).copied()).unwrap_or(0)
+    };
+    let mut candidates: Vec<Vec<usize>> = Vec::new();
+    candidates.push(movable.clone());
+    // Hot small callees first.
+    let mut hot = movable.clone();
+    hot.sort_by_key(|&i| std::cmp::Reverse((heat(i) * 64) / (size_of(i) + 8)));
+    candidates.push(hot.clone());
+    // Callees around the biggest function.
+    let mut big = hot.clone();
+    if let Some(pos) = big.iter().position(|&i| i == movable[0]) {
+        let m = big.remove(pos);
+        let half = big.len() / 2;
+        big.insert(half, m);
+    }
+    candidates.push(big);
+    let mut best = movable.clone();
+    let mut best_size = u32::MAX;
+    for c in candidates {
+        let sz = eval(&c);
+        if sz < best_size {
+            best_size = sz;
+            best = c;
+        }
+    }
+    // Hill climbing with a deterministic PRNG.
+    let mut seed: u64 = 0x9e3779b97f4a7c15;
+    let mut rnd = |n: usize| -> usize {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as usize
+    };
+    let iters = (nmovable * 6).min(400);
+    for _ in 0..iters {
+        let i = rnd(nmovable);
+        let j = rnd(nmovable);
+        if i == j {
+            continue;
+        }
+        let mut cand = best.clone();
+        if rnd(2) == 0 {
+            cand.swap(i, j);
+        } else {
+            let x = cand.remove(i);
+            cand.insert(j, x);
+        }
+        let sz = eval(&cand);
+        if sz < best_size {
+            best_size = sz;
+            best = cand;
+        }
+    }
+    let order: Vec<usize> = fixed.iter().chain(best.iter()).chain(tail.iter()).copied().collect();
+    let mut slots: Vec<Option<Section>> = sections.into_iter().map(Some).collect();
+    order.into_iter().map(|i| slots[i].take().unwrap()).collect()
 }
 
 /// Bottom-up (callee-first) order of the reachable functions.

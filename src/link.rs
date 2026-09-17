@@ -44,12 +44,18 @@ fn item_size(it: &Item, reach: Reach) -> u32 {
     }
 }
 
-pub fn link(sections: Vec<Section>, mut syms: HashMap<Rc<str>, i64>, code_start: u32, code_end: u32) -> Result<LinkOut, String> {
-    // Flatten.
-    let mut items: Vec<(usize, Item)> = Vec::new();
+/// Size of the program for a given section order (no encoding).
+pub fn measure(sections: &[Section], order: &[usize], syms: &HashMap<Rc<str>, i64>, code_start: u32) -> Option<u32> {
+    let ordered: Vec<&Section> = order.iter().map(|&i| &sections[i]).collect();
+    let (_, _, bounds, _) = relax(&ordered, syms.clone(), code_start).ok()?;
+    bounds.iter().map(|b| b.1).max()
+}
+
+fn relax(sections: &[&Section], mut syms: HashMap<Rc<str>, i64>, code_start: u32) -> Result<(Vec<u32>, Vec<Reach>, Vec<(u32, u32)>, HashMap<Rc<str>, i64>), String> {
+    let mut items: Vec<(usize, &Item)> = Vec::new();
     for (si, s) in sections.iter().enumerate() {
         for it in &s.items {
-            items.push((si, it.clone()));
+            items.push((si, it));
         }
     }
     let n = items.len();
@@ -73,7 +79,8 @@ pub fn link(sections: Vec<Section>, mut syms: HashMap<Rc<str>, i64>, code_start:
         let mut pc = code_start;
         let mut cur_sec = usize::MAX;
         for i in 0..n {
-            let (si, it) = &items[i];
+            let (si, it) = items[i];
+            let si = &si;
             if *si != cur_sec {
                 if cur_sec != usize::MAX {
                     sec_bounds[cur_sec].1 = pc;
@@ -102,7 +109,7 @@ pub fn link(sections: Vec<Section>, mut syms: HashMap<Rc<str>, i64>, code_start:
         // Check reach.
         let mut changed = false;
         for i in 0..n {
-            let Item::Insn(ins) = &items[i].1 else { continue };
+            let Item::Insn(ins) = items[i].1 else { continue };
             if !relaxable(ins) || reach[i] == Reach::Long {
                 continue;
             }
@@ -111,7 +118,7 @@ pub fn link(sections: Vec<Section>, mut syms: HashMap<Rc<str>, i64>, code_start:
             let Some(tv) = t.resolve(&|s| syms.get(s).copied()) else {
                 return Err(format!("undefined symbol '{}'", t));
             };
-            let size = item_size(&items[i].1, reach[i]);
+            let size = item_size(items[i].1, reach[i]);
             let next = addr[i] + size;
             let same_page = |after: u32| (tv as u32 & 0xf800) == (after & 0xf800);
             let ok = match (ins.mn, reach[i]) {
@@ -133,6 +140,14 @@ pub fn link(sections: Vec<Section>, mut syms: HashMap<Rc<str>, i64>, code_start:
             break;
         }
     }
+    Ok((addr, reach, sec_bounds, syms))
+}
+
+pub fn link(sections: Vec<Section>, syms: HashMap<Rc<str>, i64>, code_start: u32, code_end: u32) -> Result<LinkOut, String> {
+    let refs: Vec<&Section> = sections.iter().collect();
+    let (addr, reach, sec_bounds, syms) = relax(&refs, syms, code_start)?;
+    let items: Vec<(usize, Item)> = sections.iter().enumerate().flat_map(|(si, s)| s.items.iter().map(move |it| (si, it.clone()))).collect();
+    let n = items.len();
     // Check overlaps and bounds.
     let mut spans: Vec<(u32, u32, Rc<str>)> = sections.iter().enumerate().filter(|(_, s)| !s.items.is_empty()).map(|(i, s)| (sec_bounds[i].0, sec_bounds[i].1, s.name.clone())).collect();
     spans.sort();
