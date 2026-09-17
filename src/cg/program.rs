@@ -481,6 +481,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
     }
 
     // ---- Code generation ----
+    let fname_index: HashMap<Rc<str>, usize> = fnames.iter().enumerate().map(|(i, n)| (n.clone(), i)).collect();
     let mut summaries: Vec<Option<Summary>> = vec![None; prog.funcs.len()];
     // Summaries of naked and address-taken functions are fixed up-front.
     for &fid in &fids {
@@ -605,6 +606,64 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         let g = Gen::new(&gcx, &f_for_gen, &al, &fold, ret_locs.clone(), bank);
         let code = g.run(fnames[fid].clone());
         let mut items = code.items;
+        // Peephole optimization.
+        {
+            let fname_to_fid: &HashMap<Rc<str>, usize> = &fname_index;
+            let call_uses = |name: &str| -> peep::Res {
+                let locs_res = |locs: &[Loc]| -> peep::Res {
+                    let mut r = 0;
+                    for l in locs {
+                        match l {
+                            Loc::R(n) => r |= peep::reg_res(*n),
+                            Loc::Dir(0xE0) => r |= peep::R_A,
+                            Loc::Dir(0xF0) => r |= peep::R_B,
+                            Loc::Dir(0x82) => r |= peep::R_DPL,
+                            Loc::Dir(0x83) => r |= peep::R_DPH,
+                            _ => {}
+                        }
+                    }
+                    r
+                };
+                if name == "__call_dptr" {
+                    return peep::R_ALL;
+                }
+                if let Some(&cf) = fname_to_fid.get(name) {
+                    return match &summaries[cf] {
+                        Some(sm) => sm.params.iter().map(|p| locs_res(p)).fold(0, |a, b| a | b),
+                        None => peep::R_ALL,
+                    };
+                }
+                if name.starts_with("__") {
+                    let sm = helper_summary(name);
+                    let r = sm.params.iter().map(|p| locs_res(p)).fold(0, |a, b| a | b);
+                    // A/B based helpers.
+                    return r | peep::R_A | peep::R_B | peep::R_DPTR;
+                }
+                peep::R_ALL
+            };
+            let ret_uses = if f.attrs.interrupt.is_some() {
+                peep::R_ALL
+            } else {
+                let mut r = 0;
+                for l in &ret_locs {
+                    r |= match l {
+                        Loc::R(n) => peep::reg_res(*n),
+                        Loc::Dir(0xE0) => peep::R_A,
+                        Loc::Dir(0xF0) => peep::R_B,
+                        Loc::Dir(0x82) => peep::R_DPL,
+                        Loc::Dir(0x83) => peep::R_DPH,
+                        Loc::BitAbs(0xD7) => peep::R_C,
+                        _ => 0,
+                    };
+                }
+                r
+            };
+            let pcx = peep::PeepCtx { bank, call_uses: &call_uses, ret_uses, is_isr: f.attrs.interrupt.is_some() };
+            let has_asm_code = f.blocks.iter().any(|b| b.insts.iter().any(|x| matches!(x, Inst::Asm(_))));
+            if opts.opt > 0 && !is_naked {
+                peep::optimize(&mut items, &pcx, has_asm_code);
+            }
+        }
         // Clobbers: own + callees.
         let mut clob = code.clobbers;
         for &j in &callees[i] {
