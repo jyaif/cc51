@@ -506,6 +506,9 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
     let mut codes: Vec<(usize, Vec<Item>)> = Vec::new();
     let mut frames: Vec<FrameReq> = vec![FrameReq::default(); n];
     let mut total_clobbers: Vec<RegSet> = vec![0; prog.funcs.len()];
+    // Transitive use of B / DPTR (for interrupt context saving).
+    let mut total_uses_b: Vec<bool> = vec![false; prog.funcs.len()];
+    let mut total_uses_dptr: Vec<bool> = vec![false; prog.funcs.len()];
     for &i in &post {
         let fid = fids[i];
         let f = funcs[fid].as_ref().unwrap();
@@ -701,9 +704,29 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
             }
         }
         total_clobbers[fid] = clob;
+        let mut ub = code.uses_b || has_asm || has_indirect[i] || is_naked;
+        let mut ud = code.uses_dptr || has_asm || has_indirect[i] || is_naked;
+        for &j in &callees[i] {
+            ub |= total_uses_b[fids[j]];
+            ud |= total_uses_dptr[fids[j]];
+        }
+        for b in &f.blocks {
+            for ins in &b.insts {
+                if let Inst::Call(_, Callee::Runtime(_), _) = ins {
+                    ub = true;
+                    ud = true;
+                }
+                if alloc::inst_clobbers(f, ins, &callee_for_alloc) == ALL_REGS {
+                    ub = true;
+                    ud = true;
+                }
+            }
+        }
+        total_uses_b[fid] = ub;
+        total_uses_dptr[fid] = ud;
         // ISR prologue/epilogue.
         if let Some(_vec) = f.attrs.interrupt {
-            expand_isr(&mut items, clob, code.uses_b, code.uses_dptr, f.attrs.using);
+            expand_isr(&mut items, clob, ub, ud, f.attrs.using);
         }
         // Summary.
         if !is_naked {
@@ -718,7 +741,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
                     })
                     .collect()
             };
-            summaries[fid] = Some(Summary { params, ret: ret_locs.clone(), clobbers: clob, keeps_b: !code.uses_b, keeps_dptr: !code.uses_dptr });
+            summaries[fid] = Some(Summary { params, ret: ret_locs.clone(), clobbers: clob, keeps_b: !ub, keeps_dptr: !ud });
         }
         // Frame request.
         let mut fr = FrameReq::default();
