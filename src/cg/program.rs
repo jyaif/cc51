@@ -1106,13 +1106,37 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     for &g in &xdata_globals {
         let gl = &prog.globals[g];
         let size = prog.global_size(g);
-        let bytes = gl.init.as_ref().map(|i| i.bytes.clone()).unwrap_or_else(|| vec![0; size as usize]);
+        let mut bytes: Vec<Expr> = match &gl.init {
+            Some(i) => (0..size as usize).map(|k| Expr::num(*i.bytes.get(k).unwrap_or(&0) as i64)).collect(),
+            None => (0..size as usize).map(|_| Expr::num(0)).collect(),
+        };
+        if let Some(init) = &gl.init {
+            for r in &init.relocs {
+                let tname = match r.target {
+                    RelocTarget::Global(x) => gnames[x].clone(),
+                    RelocTarget::Func(x) => fnames[x].clone(),
+                };
+                let e = Expr::sym_off(&tname, r.addend);
+                let o = r.offset as usize;
+                bytes[o] = e.clone().lo();
+                if r.size >= 2 {
+                    bytes[o + 1] = e.hi();
+                }
+                if r.size >= 3 {
+                    let tag = match r.target {
+                        RelocTarget::Global(x) => global_space(x).gptr_tag(),
+                        RelocTarget::Func(_) => 0x80,
+                    };
+                    bytes[o + 2] = Expr::num(tag as i64);
+                }
+            }
+        }
         start.push(Item::Insn(crate::asm::Insn::new(Mn::Mov, vec![Op::Dptr, Op::Imm(Expr::sym(&gnames[g]))])));
-        for (k, b) in bytes.iter().enumerate() {
+        for (k, b) in bytes.into_iter().enumerate() {
             if k > 0 {
                 start.push(Item::Insn(crate::asm::Insn::new(Mn::Inc, vec![Op::Dptr])));
             }
-            start.push(Item::Insn(crate::asm::Insn::new(Mn::Mov, vec![Op::A, Op::imm(*b as i64)])));
+            start.push(Item::Insn(crate::asm::Insn::new(Mn::Mov, vec![Op::A, Op::Imm(b)])));
             start.push(Item::Insn(crate::asm::Insn::new(Mn::Movx, vec![Op::AtDptr, Op::A])));
         }
     }
@@ -1158,6 +1182,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
         cg_outline(&mut sections, &outline_ok, &globals);
     }
     // Constant data in code space.
+    let mut const_items: Vec<Item> = Vec::new();
     for &g in &code_globals {
         let gl = &prog.globals[g];
         let size = prog.global_size(g);
@@ -1184,7 +1209,11 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
             }
         }
         items.push(Item::Db(bytes));
-        sections.push(Section { name: gnames[g].clone(), items, org: None });
+        const_items.extend(items);
+    }
+    if !const_items.is_empty() {
+        // One section keeps the objects in declaration order, as SDCC lays them out.
+        sections.push(Section { name: "__constdata".into(), items: const_items, org: None });
     }
     let nmovable = sections.len() - nfixed;
     let code_end = opts.code_start + opts.code_size;
@@ -1194,6 +1223,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     } else {
         sections
     };
+    let xdata_syms: Vec<(Rc<str>, i64)> = xdata_globals.iter().map(|&g| (gnames[g].clone(), *syms.get(&gnames[g]).unwrap_or(&0))).collect();
     let lk = link::link(sections, syms, code_origin, code_end)?;
     let ranges: Vec<(u32, u32)> = lk.sections.iter().map(|(_, a, s)| (*a, *a + *s)).collect();
     let hex = link::intel_hex(&lk.image, &ranges);
@@ -1215,6 +1245,14 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     let _ = writeln!(map, "RAM symbols:");
     for (k, v) in rs {
         let _ = writeln!(map, "  {:#04x} {}", v, k);
+    }
+    if !xdata_globals.is_empty() {
+        let _ = writeln!(map, "External RAM:");
+        let mut xs = xdata_syms;
+        xs.sort_by_key(|x| x.1);
+        for (k, v) in xs {
+            let _ = writeln!(map, "  {:#06x} {}", v, k);
+        }
     }
     Ok(Output { image: lk.image, hex, listing: lk.listing, map, code_size, ram_used: lay.ram_end })
 }

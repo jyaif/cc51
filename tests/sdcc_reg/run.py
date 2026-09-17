@@ -33,6 +33,12 @@ insts = []
 for s in srcs:
     insts += gen.generate(s, os.path.join(OUT, 'src'))
 
+# Tests whose SDCC-specific expectations we knowingly do not match.
+EXPECTED_DIFF = {
+    # SDCC's small-model printf prints "<NO FLOAT>"; cc51 prints the value.
+    'snprintf_type_FLOAT',
+}
+
 prev = {}
 if os.path.exists(os.path.join(OUT, 'results.txt')):
     for l in open(os.path.join(OUT, 'results.txt')):
@@ -40,7 +46,7 @@ if os.path.exists(os.path.join(OUT, 'results.txt')):
         if len(w) >= 2 and w[0] in ('PASS', 'FAIL', 'CERR', 'CTIMEOUT', 'STIMEOUT', 'NOSUMMARY'):
             prev[w[1]] = w[0]
 if failed_only:
-    insts = [p for p in insts if prev.get(os.path.basename(p)[:-2], 'PASS') != 'PASS']
+    insts = [p for p in insts if prev.get(os.path.basename(p)[:-2], 'PASS') not in ('PASS', 'XFAIL')]
 
 def run(path):
     name = os.path.basename(path)[:-2]
@@ -73,6 +79,7 @@ def run(path):
 counts = {}
 with ThreadPoolExecutor(jobs) as ex:
     results = sorted(ex.map(run, insts))
+results = [(n, 'XFAIL' if (st == 'FAIL' and n in EXPECTED_DIFF) else st, m) for n, st, m in results]
 for name, st, msg in results:
     if prev.get(name) == 'PASS' and st != 'PASS':
         print(f'REGRESSION {name}')
@@ -82,6 +89,6 @@ with open(os.path.join(OUT, 'results.txt'), 'w') as f:
         f.write(f'{prev[name]} {name}\n')
 for name, st, msg in results:
         counts[st] = counts.get(st, 0) + 1
-        if st != 'PASS':
+        if st not in ('PASS', 'XFAIL'):
             print(f'{st:9} {name}: {msg}' if verbose else f'{st:9} {name}: {msg.splitlines()[0] if msg else ""}')
 print(counts)

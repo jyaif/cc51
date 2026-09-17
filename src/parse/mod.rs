@@ -1097,8 +1097,12 @@ impl<'a> Parser<'a> {
             (IntKind::Int, false)
         } else if min >= i32::MIN as i64 && max <= i32::MAX as i64 {
             (IntKind::Long, true)
-        } else {
+        } else if min >= 0 && max <= u32::MAX as i64 {
             (IntKind::Long, false)
+        } else if min >= 0 {
+            (IntKind::LongLong, false)
+        } else {
+            (IntKind::LongLong, true)
         };
         self.prog.enums[id].complete = true;
         if let Some(tag) = tag {
@@ -1336,11 +1340,16 @@ impl<'a> Parser<'a> {
             return Space::Bit;
         }
         // SDCC places const, non-volatile static objects into program memory.
+        // The qualifier may sit on the array type itself (through a typedef) or on the elements.
         let mut base = ty;
+        let mut is_const = ty.q.is_const;
+        let mut is_volatile = ty.q.is_volatile;
         while let TypeKind::Array(e, _) = &base.kind {
             base = e;
+            is_const |= base.q.is_const;
+            is_volatile |= base.q.is_volatile;
         }
-        if base.q.is_const && !base.q.is_volatile && spec.at.is_none() {
+        if is_const && !is_volatile && spec.at.is_none() {
             return Space::Code;
         }
         Space::Data

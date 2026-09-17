@@ -257,6 +257,9 @@ pub fn parse_char_literal(s: &str, loc: Loc) -> Result<(i64, bool)> {
             i += 1;
             if wide {
                 vals.push(c as u32);
+            } else if ('\u{E080}'..='\u{E0FF}').contains(&c) {
+                // A byte from a non-UTF-8 source.
+                vals.push(c as u32 & 0xff);
             } else {
                 let mut buf = [0u8; 4];
                 for b in c.encode_utf8(&mut buf).bytes() {
