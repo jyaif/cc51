@@ -561,6 +561,37 @@ impl Func {
         self.blocks.push(Block { insts: Vec::new(), term: Term::Unreachable });
         (self.blocks.len() - 1) as BlockId
     }
+    /// Check IR invariants (debugging aid).
+    pub fn verify(&self) -> Result<(), String> {
+        let n = self.vregs.len() as u32;
+        let nb = self.blocks.len() as u32;
+        for (bi, b) in self.blocks.iter().enumerate() {
+            for (ii, i) in b.insts.iter().enumerate() {
+                for u in i.uses() {
+                    if u >= n {
+                        return Err(format!("{}: b{} i{}: use of %{} out of range ({:?})", self.name, bi, ii, u, i));
+                    }
+                }
+                if let Some(d) = i.def() {
+                    if d >= n {
+                        return Err(format!("{}: b{} i{}: def of %{} out of range", self.name, bi, ii, d));
+                    }
+                }
+            }
+            for u in b.term.uses() {
+                if u >= n {
+                    return Err(format!("{}: b{} term: use of %{} out of range", self.name, bi, u));
+                }
+            }
+            for s in b.term.succs() {
+                if s >= nb {
+                    return Err(format!("{}: b{}: successor b{} out of range", self.name, bi, s));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn preds(&self) -> Vec<Vec<BlockId>> {
         let mut p = vec![Vec::new(); self.blocks.len()];
         for (i, b) in self.blocks.iter().enumerate() {

@@ -280,92 +280,100 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         .chain(fnames.iter().enumerate().map(|(i, n)| (n.clone(), crate::ast::Sym::Func(i))))
         .collect();
 
-    let mut opt_funcs: HashSet<usize> = HashSet::new();
-    let mut reach_f: HashSet<usize> = HashSet::new();
-    let mut reach_g: HashSet<usize> = HashSet::new();
-    let mut runtime_used: HashSet<String> = HashSet::new();
-    let mut work: Vec<crate::ast::Sym> = roots.iter().map(|f| crate::ast::Sym::Func(*f)).collect();
-    while let Some(s) = work.pop() {
-        match s {
-            crate::ast::Sym::Global(g) => {
-                if !reach_g.insert(g) {
-                    continue;
-                }
-                if let Some(init) = &prog.globals[g].init {
-                    for r in &init.relocs {
-                        work.push(match r.target {
-                            RelocTarget::Global(x) => crate::ast::Sym::Global(x),
-                            RelocTarget::Func(x) => crate::ast::Sym::Func(x),
-                        });
+    // Optimize every function body once.
+    for f in funcs.iter_mut().flatten() {
+        if opts.dump_ir_raw {
+            eprintln!("{}", ir::print::func(f));
+        }
+        crate::opt::optimize_func(f, opts.opt);
+    }
+    let compute_reach = |funcs: &Vec<Option<Func>>| -> (HashSet<usize>, HashSet<usize>, HashSet<String>) {
+        let mut reach_f: HashSet<usize> = HashSet::new();
+        let mut reach_g: HashSet<usize> = HashSet::new();
+        let mut runtime_used: HashSet<String> = HashSet::new();
+        let mut work: Vec<crate::ast::Sym> = roots.iter().map(|f| crate::ast::Sym::Func(*f)).collect();
+        while let Some(s) = work.pop() {
+            match s {
+                crate::ast::Sym::Global(g) => {
+                    if !reach_g.insert(g) {
+                        continue;
                     }
-                }
-            }
-            crate::ast::Sym::Func(fid) => {
-                if !reach_f.insert(fid) {
-                    continue;
-                }
-                let Some(f) = funcs[fid].as_mut() else {
-                    // Declared but not defined: resolved later (may be a runtime/asm symbol).
-                    continue;
-                };
-                if !opt_funcs.contains(&fid) {
-                    if opts.dump_ir_raw {
-                        eprintln!("{}", ir::print::func(f));
-                    }
-                    crate::opt::optimize_func(f, opts.opt);
-                    opt_funcs.insert(fid);
-                }
-                let f = funcs[fid].as_ref().unwrap();
-                let tu = prog.funcs[fid].tu;
-                let mut add_sym = |s: &Sym, work: &mut Vec<crate::ast::Sym>| match s {
-                    Sym::Global(g) => work.push(crate::ast::Sym::Global(*g)),
-                    Sym::Func(x) => work.push(crate::ast::Sym::Func(*x)),
-                    _ => {}
-                };
-                for b in &f.blocks {
-                    for ins in &b.insts {
-                        ins.for_each_val(|v| {
-                            if let Val::Addr(s, _) = v {
-                                add_sym(s, &mut work);
-                            }
-                        });
-                        match ins {
-                            Inst::Load(_, Mem::Sym(s, _)) | Inst::Store(Mem::Sym(s, _), _, _) => add_sym(s, &mut work),
-                            Inst::MemCopy(a, b, _) => {
-                                if let Mem::Sym(s, _) = a {
-                                    add_sym(s, &mut work);
-                                }
-                                if let Mem::Sym(s, _) = b {
-                                    add_sym(s, &mut work);
-                                }
-                            }
-                            Inst::MemSet(Mem::Sym(s, _), _, _) => add_sym(s, &mut work),
-                            _ => {}
+                    if let Some(init) = &prog.globals[g].init {
+                        for r in &init.relocs {
+                            work.push(match r.target {
+                                RelocTarget::Global(x) => crate::ast::Sym::Global(x),
+                                RelocTarget::Func(x) => crate::ast::Sym::Func(x),
+                            });
                         }
-                        match ins {
-                            Inst::Call(_, Callee::Direct(x), _) => work.push(crate::ast::Sym::Func(*x)),
-                            Inst::Call(_, Callee::Runtime(n), _) => {
-                                runtime_used.insert(n.to_string());
-                            }
-                            Inst::Call(_, Callee::Indirect(_), _) => {
-                                runtime_used.insert("__call_dptr".into());
-                            }
-                            Inst::Asm(t) => {
-                                for s in asm_syms(t, tu) {
-                                    if let Some(x) = name_to_sym.get(&s) {
-                                        work.push(*x);
-                                    } else {
-                                        runtime_used.insert(s.to_string());
+                    }
+                }
+                crate::ast::Sym::Func(fid) => {
+                    if !reach_f.insert(fid) {
+                        continue;
+                    }
+                    let Some(f) = funcs[fid].as_ref() else { continue };
+                    let tu = prog.funcs[fid].tu;
+                    let add_sym = |s: &Sym, work: &mut Vec<crate::ast::Sym>| match s {
+                        Sym::Global(g) => work.push(crate::ast::Sym::Global(*g)),
+                        Sym::Func(x) => work.push(crate::ast::Sym::Func(*x)),
+                        _ => {}
+                    };
+                    for b in &f.blocks {
+                        for ins in &b.insts {
+                            ins.for_each_val(|v| {
+                                if let Val::Addr(s, _) = v {
+                                    add_sym(s, &mut work);
+                                }
+                            });
+                            match ins {
+                                Inst::Load(_, Mem::Sym(s, _)) | Inst::Store(Mem::Sym(s, _), _, _) => add_sym(s, &mut work),
+                                Inst::MemCopy(a, b, _) => {
+                                    if let Mem::Sym(s, _) = a {
+                                        add_sym(s, &mut work);
+                                    }
+                                    if let Mem::Sym(s, _) = b {
+                                        add_sym(s, &mut work);
                                     }
                                 }
+                                Inst::MemSet(Mem::Sym(s, _), _, _) => add_sym(s, &mut work),
+                                _ => {}
                             }
-                            _ => {}
+                            match ins {
+                                Inst::Call(_, Callee::Direct(x), _) => work.push(crate::ast::Sym::Func(*x)),
+                                Inst::Call(_, Callee::Runtime(n), _) => {
+                                    runtime_used.insert(n.to_string());
+                                }
+                                Inst::Call(_, Callee::Indirect(_), _) => {
+                                    runtime_used.insert("__call_dptr".into());
+                                }
+                                Inst::Asm(t) => {
+                                    for s in asm_syms(t, tu) {
+                                        if let Some(x) = name_to_sym.get(&s) {
+                                            work.push(*x);
+                                        } else {
+                                            runtime_used.insert(s.to_string());
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
             }
         }
+        (reach_f, reach_g, runtime_used)
+    };
+    let (reach_f0, _, _) = compute_reach(&funcs);
+    // ---- Inlining ----
+    if opts.opt > 0 {
+        let order = bottom_up(&funcs, &reach_f0);
+        let keep = |f: usize| roots.contains(&f) || prog.funcs[f].addr_taken;
+        let is_inline = |f: usize| prog.funcs[f].is_inline;
+        let level = opts.opt;
+        crate::opt::inline::run(&mut funcs, &order, &keep, &is_inline, &|f: &mut Func| crate::opt::optimize_func(f, level));
     }
+    let (reach_f, reach_g, mut runtime_used) = compute_reach(&funcs);
     // Direct references to undefined functions are errors.
     for &fid in &reach_f {
         if funcs[fid].is_none() {
@@ -975,6 +983,33 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         let _ = writeln!(map, "  {:#04x} {}", v, k);
     }
     Ok(Output { image: lk.image, hex, listing: lk.listing, map, code_size, ram_used: lay.ram_end })
+}
+
+/// Bottom-up (callee-first) order of the reachable functions.
+fn bottom_up(funcs: &[Option<Func>], reach: &HashSet<usize>) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    fn visit(f: usize, funcs: &[Option<Func>], seen: &mut HashSet<usize>, out: &mut Vec<usize>) {
+        if !seen.insert(f) {
+            return;
+        }
+        if let Some(func) = &funcs[f] {
+            for b in &func.blocks {
+                for i in &b.insts {
+                    if let Inst::Call(_, Callee::Direct(c), _) = i {
+                        visit(*c, funcs, seen, out);
+                    }
+                }
+            }
+        }
+        out.push(f);
+    }
+    let mut r: Vec<usize> = reach.iter().copied().collect();
+    r.sort();
+    for f in r {
+        visit(f, funcs, &mut seen, &mut out);
+    }
+    out
 }
 
 fn glob_res(prog: &Program, g: usize, gnames: &[Rc<str>]) -> SymRes {

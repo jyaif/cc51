@@ -5,6 +5,7 @@ pub mod cfg;
 pub mod combine;
 pub mod dataflow;
 pub mod dce;
+pub mod inline;
 
 use crate::ir::Func;
 
