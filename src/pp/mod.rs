@@ -43,6 +43,8 @@ pub struct Preprocessor {
     files: Vec<(PathBuf, Option<usize>)>,
     counter: u64,
     pub deps: Vec<PathBuf>,
+    /// Honour `# N "file"` line markers (for preprocessed input).
+    pub line_markers: bool,
 }
 
 fn mk(kind: PKind, text: &str, loc: Loc) -> PTok {
@@ -66,6 +68,7 @@ impl Preprocessor {
             files: Vec::new(),
             counter: 0,
             deps: Vec::new(),
+            line_markers: false,
         };
         for (k, v) in [
             ("__STDC__", "1"),
@@ -130,7 +133,10 @@ impl Preprocessor {
 
     pub fn preprocess_source(&mut self, text: &str, path: &Path) -> Result<Vec<PTok>> {
         let fid = diag::add_file(&path.display().to_string());
-        let toks = lexer::tokenize(text, fid)?;
+        let mut toks = lexer::tokenize(text, fid)?;
+        if self.line_markers {
+            toks = apply_line_markers(toks);
+        }
         self.push_file(toks, path.to_path_buf(), None, Loc { file: fid, line: 1, col: 1 });
         let mut out = Vec::new();
         self.run(&mut out, false)?;
@@ -983,6 +989,38 @@ impl Preprocessor {
     }
 }
 
+/// Remap token locations according to `# N "file"` markers and drop the markers.
+fn apply_line_markers(toks: Vec<PTok>) -> Vec<PTok> {
+    let mut out = Vec::with_capacity(toks.len());
+    let mut map: Option<(u32, u32, u32)> = None; // (marker line, file id, line number at next line)
+    let mut i = 0;
+    let mut files: HashMap<String, u32> = HashMap::new();
+    while i < toks.len() {
+        let t = &toks[i];
+        if t.bol && t.is("#") && i + 2 < toks.len() && toks[i + 1].kind == PKind::Number && !toks[i + 1].bol && toks[i + 2].kind == PKind::Str && !toks[i + 2].bol {
+            let line: u32 = toks[i + 1].text.parse().unwrap_or(1);
+            let name = toks[i + 2].text.trim_matches('"').to_string();
+            let fid = *files.entry(name.clone()).or_insert_with(|| diag::add_file(&name));
+            map = Some((t.loc.line, fid, line));
+            i += 3;
+            // Skip anything else on the marker line.
+            while i < toks.len() && !toks[i].bol {
+                i += 1;
+            }
+            continue;
+        }
+        let mut t = t.clone();
+        if let Some((ml, fid, base)) = map {
+            if t.loc.line > ml {
+                t.loc = Loc { file: fid, line: base + (t.loc.line - ml - 1), col: t.loc.col };
+            }
+        }
+        out.push(t);
+        i += 1;
+    }
+    out
+}
+
 fn detect_guard(toks: &[PTok]) -> Option<Rc<str>> {
     // #ifndef X / #define X ... #endif at the very end with nothing after.
     if toks.len() < 6 {
@@ -1077,8 +1115,11 @@ pub fn tokens_to_text(toks: &[PTok]) -> String {
     let mut s = String::new();
     let mut last_line = 0;
     let mut last_file = u32::MAX;
+    let mut after_pragma = false;
     for t in toks {
-        if t.loc.file != last_file || t.bol || t.kind == PKind::Pragma {
+        let new_line = t.loc.file != last_file || t.bol || t.kind == PKind::Pragma || after_pragma || t.loc.line != last_line;
+        after_pragma = t.kind == PKind::Pragma;
+        if new_line {
             if !s.is_empty() {
                 s.push('\n');
             }

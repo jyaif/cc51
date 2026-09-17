@@ -6,7 +6,7 @@ CC=${CC:-./target/release/cc51}
 T=${TMPDIR:-/tmp}/cc51-dino
 mkdir -p $T
 CYCLES=${CYCLES:-100000000}
-$CC $DINO_ARGS -o $T/dino.ihx --lst $T/dino.lst --map $T/dino.map || exit 1
+$CC --size $DINO_ARGS -o $T/dino.ihx --lst $T/dino.lst --map $T/dino.map || exit 1
 SDCC_HEX=${TMPDIR:-/tmp}/sdcc-dino-$MODEL/dino.ihx
 [ -f $SDCC_HEX ] || ./tests/sdcc_dino.sh >/dev/null
 [ -f $T/sdcc-$MODEL.trace ] || ./target/release/minitel_sim $SDCC_HEX $T/sdcc-$MODEL.trace $CYCLES $MODEL

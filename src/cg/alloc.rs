@@ -118,7 +118,7 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
     let mut copy_pairs: Vec<(VReg, VReg)> = Vec::new();
     let depth = loop_depths(f);
     let mut ever_live = BitSet::new(n);
-    // Internal-RAM pointer dereferences: (base vreg, vregs live across or used by the instruction).
+    // Internal-RAM pointer dereferences: (base vreg usable in place, vregs live across or used by the instruction).
     let mut ptr_sites: Vec<(Option<usize>, Vec<usize>)> = Vec::new();
 
     let add_interf = |interf: &mut Vec<BitSet>, a: usize, b: usize| {
@@ -228,12 +228,15 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
             // Pointer bases.
             let mut site_needed = false;
             let mut site_base: Option<usize> = None;
+            let live_after_here = l.clone();
             let mut mark_ptr = |m: &Mem| {
                 match m {
-                    Mem::Ptr(Val::R(p), _, PSpace::S(Space::Data | Space::Idata)) => {
+                    Mem::Ptr(Val::R(p), off, PSpace::S(Space::Data | Space::Idata)) => {
                         ptr_base[*p as usize] = true;
                         site_needed = true;
-                        if !folded(*p) {
+                        // The base register can serve as the pointer only if it may be modified here.
+                        let usable = *off == 0 || (!live_after_here.contains(*p as usize) && (1..=3).contains(off));
+                        if !folded(*p) && usable {
                             site_base = Some(*p as usize);
                         }
                     }

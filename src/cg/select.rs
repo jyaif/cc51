@@ -76,6 +76,8 @@ pub struct Gen<'a> {
     nlabel: u32,
     scratch: RegSet,
     cur: (usize, usize),
+    /// Register pushed by `set_rptr` that must be restored after the access.
+    pending_pop: Option<u8>,
     pub uses_b: bool,
     pub uses_dptr: bool,
     is_isr: bool,
@@ -99,6 +101,7 @@ impl<'a> Gen<'a> {
             nlabel: 0,
             scratch: 0,
             cur: (0, 0),
+            pending_pop: None,
             uses_b: false,
             uses_dptr: false,
             is_isr: f.attrs.interrupt.is_some(),
@@ -1358,7 +1361,33 @@ impl<'a> Gen<'a> {
         }
         let r = match self.pick_ptr_reg(busy) {
             Some(r) => r,
-            None => panic!("no free pointer register in {}", self.f.name),
+            None => {
+                // Last resort: borrow a pointer register (not holding an operand) around the access.
+                let extra_regs = {
+                    let mut m: RegSet = 0;
+                    for v in extra_busy {
+                        if let Val::R(x) = v {
+                            for l in self.al.locs.get(*x as usize).map(|v| v.as_slice()).unwrap_or(&[]) {
+                                if let Loc::R(q) = l {
+                                    m |= 1 << q;
+                                }
+                            }
+                        }
+                    }
+                    if let Val::R(pr) = p {
+                        for l in self.al.locs.get(*pr as usize).map(|v| v.as_slice()).unwrap_or(&[]) {
+                            if let Loc::R(q) = l {
+                                m |= 1 << q;
+                            }
+                        }
+                    }
+                    m
+                };
+                let r = [1u8, 0].into_iter().find(|r| extra_regs & (1 << r) == 0).expect("no pointer register can be borrowed");
+                self.e1(Mn::Push, Op::dir((self.bank * 8 + r) as i64));
+                self.pending_pop = Some(r);
+                r
+            }
         };
         self.scratch |= 1 << r;
         match p {
@@ -1412,6 +1441,14 @@ impl<'a> Gen<'a> {
             }
         }
         r
+    }
+
+    fn release_rptr(&mut self) {
+        if let Some(r) = self.pending_pop.take() {
+            let a = self.st.a.clone();
+            self.e1(Mn::Pop, Op::dir((self.bank * 8 + r) as i64));
+            self.st.a = a;
+        }
     }
 
     fn set_reg_imm(&mut self, r: u8, e: Expr) {
@@ -1496,6 +1533,7 @@ impl<'a> Gen<'a> {
             PSpace::S(Space::Data | Space::Idata) => {
                 let r = self.set_rptr(m, k, &[]);
                 self.e2(Mn::Mov, Op::A, Op::AtR(r));
+                self.release_rptr();
             }
             PSpace::Generic => {
                 self.set_gptr(m, k);
@@ -1602,6 +1640,7 @@ impl<'a> Gen<'a> {
                     }
                 }
                 self.restore_rptr(m, r, n - 1);
+                self.release_rptr();
             }
             PSpace::S(Space::Xdata | Space::Pdata) if n > 1 => {
                 for k in 0..n {
@@ -1712,6 +1751,7 @@ impl<'a> Gen<'a> {
                     }
                     self.e2(Mn::Mov, Op::AtR(r), Op::A);
                     self.clobber_mem();
+                    self.release_rptr();
                     return;
                 }
                 let r = self.set_rptr(m, 0, &vals);
@@ -1741,6 +1781,7 @@ impl<'a> Gen<'a> {
                     self.clobber_mem();
                 }
                 self.restore_rptr(m, r, n - 1);
+                self.release_rptr();
             }
             PSpace::S(Space::Xdata | Space::Pdata) => {
                 for k in 0..n {
@@ -1804,6 +1845,7 @@ impl<'a> Gen<'a> {
                 let _ = saved;
                 self.e2(Mn::Mov, Op::AtR(r), Op::A);
                 self.clobber_mem();
+                self.release_rptr();
             }
             PSpace::S(Space::Xdata | Space::Pdata) => {
                 self.e2(Mn::Mov, Op::dir(B_DIR), Op::A);
@@ -2241,6 +2283,10 @@ impl<'a> Gen<'a> {
             Inst::MemSet(d, v, n) => self.gen_memset(d, *v, *n),
             Inst::Nop => {}
         }
+    }
+
+    fn check_balanced(&self) {
+        assert!(self.pending_pop.is_none(), "unbalanced pointer register save in {}", self.f.name);
     }
 
     fn gen_bin(&mut self, op: BinK, d: VReg, a: Val, b: Val) {
@@ -2839,6 +2885,7 @@ impl<'a> Gen<'a> {
                     self.djnz_counter(cnt, &top);
                 }
                 self.clobber_mem();
+                self.release_rptr();
             }
             PSpace::S(Space::Xdata) => {
                 self.set_dptr_mem(d, 0);
@@ -2921,6 +2968,7 @@ impl<'a> Gen<'a> {
                 self.e1(Mn::Inc, Op::R(rd));
                 self.djnz_counter(cnt, &top);
                 self.st = State::default();
+                assert!(self.pending_pop.is_none(), "pointer register fallback in block copy");
             }
             (PSpace::S(Space::Data | Space::Idata), PSpace::S(Space::Code | Space::Xdata)) => {
                 let rd = self.set_rptr(d, 0, &[]);
@@ -2940,6 +2988,7 @@ impl<'a> Gen<'a> {
                 self.e1(Mn::Inc, Op::Dptr);
                 self.djnz_counter(cnt, &top);
                 self.st = State::default();
+                self.release_rptr();
             }
             _ => {
                 // Generic per-byte copy.
@@ -3295,6 +3344,7 @@ impl<'a> Gen<'a> {
             for (i, ins) in blk.insts.iter().enumerate() {
                 self.cur = (b as usize, i);
                 self.gen_inst(ins);
+                self.check_balanced();
             }
             self.cur = (b as usize, blk.insts.len());
             match &blk.term {

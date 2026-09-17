@@ -18,10 +18,13 @@ const USAGE: &str = "usage: cc51 [options] files...
   --map <file>       write a map file
   --lst <file>       write a listing file
   --dump-ir          print optimized IR and allocation
+  --size             print code size and RAM usage
   -w                 disable warnings
 Accepts SDCC-style options (-mmcs51, --std-*, --model-small) for compatibility.";
 
 struct Args {
+    libdirs: Vec<PathBuf>,
+    libs: Vec<String>,
     incs: Vec<PathBuf>,
     defs: Vec<(String, Option<String>)>,
     files: Vec<String>,
@@ -31,6 +34,7 @@ struct Args {
     opts: cg::program::Options,
     map: Option<String>,
     lst: Option<String>,
+    print_size: bool,
 }
 
 fn parse_num(s: &str) -> u32 {
@@ -49,6 +53,8 @@ fn parse_num(s: &str) -> u32 {
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut a = Args {
+        libdirs: vec![],
+        libs: vec![],
         incs: vec![],
         defs: vec![],
         files: vec![],
@@ -58,6 +64,7 @@ fn parse_args() -> Args {
         opts: Default::default(),
         map: None,
         lst: None,
+        print_size: false,
     };
     let mut i = 0;
     while i < argv.len() {
@@ -87,9 +94,13 @@ fn parse_args() -> Args {
             "--map" => a.map = Some(next()),
             "--lst" => a.lst = Some(next()),
             "--dump-ir" => a.opts.dump_ir = true,
+            "--size" => a.print_size = true,
             "--dump-ir-raw" => a.opts.dump_ir_raw = true,
             "-w" => diag::set_warnings(false),
             "-I" => a.incs.push(PathBuf::from(next())),
+            "-L" => a.libdirs.push(PathBuf::from(next())),
+            "-l" => a.libs.push(next()),
+            "-k" => a.libdirs.push(PathBuf::from(next())),
             "-D" => {
                 let d = next();
                 a.defs.push(match d.split_once('=') {
@@ -100,6 +111,10 @@ fn parse_args() -> Args {
             _ => {
                 if let Some(p) = s.strip_prefix("-I") {
                     a.incs.push(PathBuf::from(p));
+                } else if let Some(p) = s.strip_prefix("-L") {
+                    a.libdirs.push(PathBuf::from(p));
+                } else if let Some(p) = s.strip_prefix("-l") {
+                    a.libs.push(p.to_string());
                 } else if let Some(d) = s.strip_prefix("-D") {
                     a.defs.push(match d.split_once('=') {
                         Some((k, v)) => (k.to_string(), Some(v.to_string())),
@@ -150,7 +165,110 @@ fn fail(e: impl std::fmt::Display) -> ! {
     exit(1)
 }
 
+/// `sdar`-compatible archiver: `sdar -rc lib.lib objs...`
+fn ar_main(args: &[String]) {
+    let mut it = args.iter();
+    let Some(opts) = it.next() else {
+        eprintln!("usage: sdar -rc <library> <objects...>");
+        exit(1)
+    };
+    let opts = opts.trim_start_matches('-');
+    if !opts.contains('r') && !opts.contains('q') {
+        eprintln!("sdar (cc51): only -r/-q is supported");
+        exit(1);
+    }
+    let Some(lib) = it.next() else {
+        eprintln!("sdar: missing library name");
+        exit(1)
+    };
+    let mut out = String::new();
+    if !opts.contains('c') || Path::new(lib).exists() {
+        if let Ok(old) = std::fs::read_to_string(lib) {
+            out.push_str(&old);
+        }
+    }
+    for o in it {
+        let data = std::fs::read_to_string(o).unwrap_or_else(|e| fail(format!("sdar: cannot read {}: {}", o, e)));
+        if !data.starts_with(OBJ_MAGIC) {
+            fail(format!("sdar: {} is not a cc51 object", o));
+        }
+        out.push_str(&data);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    std::fs::write(lib, out).unwrap_or_else(|e| fail(format!("sdar: cannot write {}: {}", lib, e)));
+}
+
+/// `makebin`-compatible Intel HEX to binary converter.
+fn makebin_main(args: &[String]) {
+    let mut pack = false;
+    let mut size: Option<u32> = None;
+    let mut files = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" => pack = true,
+            "-s" => {
+                i += 1;
+                size = Some(parse_num(&args[i]));
+            }
+            a => files.push(a.to_string()),
+        }
+        i += 1;
+    }
+    let text = match files.first() {
+        Some(f) => std::fs::read_to_string(f).unwrap_or_else(|e| fail(format!("makebin: {}: {}", f, e))),
+        None => {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).unwrap();
+            s
+        }
+    };
+    let mut image: Vec<u8> = vec![0xff; size.unwrap_or(0x8000) as usize];
+    let mut last = 0usize;
+    for line in text.lines() {
+        let Some(l) = line.trim().strip_prefix(':') else { continue };
+        let b: Vec<u8> = (0..l.len() / 2).filter_map(|k| u8::from_str_radix(&l[2 * k..2 * k + 2], 16).ok()).collect();
+        if b.len() < 5 || b[3] != 0 {
+            continue;
+        }
+        let n = b[0] as usize;
+        let addr = ((b[1] as usize) << 8) | b[2] as usize;
+        if addr + n > image.len() {
+            image.resize(addr + n, 0xff);
+        }
+        image[addr..addr + n].copy_from_slice(&b[4..4 + n]);
+        last = last.max(addr + n);
+    }
+    if pack {
+        image.truncate(last);
+    }
+    match files.get(1) {
+        Some(o) => std::fs::write(o, &image).unwrap_or_else(|e| fail(format!("makebin: {}: {}", o, e))),
+        None => std::io::Write::write_all(&mut std::io::stdout(), &image).unwrap(),
+    }
+}
+
 fn main() {
+    let argv0 = std::env::args().next().unwrap_or_default();
+    let prog = Path::new(&argv0).file_name().and_then(|s| s.to_str()).unwrap_or("cc51").to_string();
+    let rest: Vec<String> = std::env::args().skip(1).collect();
+    if prog.starts_with("sdar") || rest.first().map_or(false, |a| a == "--ar") {
+        let args = if prog.starts_with("sdar") { rest } else { rest[1..].to_vec() };
+        ar_main(&args);
+        return;
+    }
+    if prog.starts_with("makebin") || rest.first().map_or(false, |a| a == "--makebin") {
+        let args = if prog.starts_with("makebin") { rest } else { rest[1..].to_vec() };
+        makebin_main(&args);
+        return;
+    }
+    if rest.iter().any(|a| a == "--version" || a == "-v") {
+        println!("SDCC : mcs51 4.6.0 #0 (cc51 {}) (compatible)", env!("CARGO_PKG_VERSION"));
+        println!("published under GNU General Public License (GPL)");
+        return;
+    }
     let a = parse_args();
     if a.files.is_empty() {
         eprintln!("{}", USAGE);
@@ -182,24 +300,36 @@ fn main() {
     }
     let mut prog = ast::Program::new();
     let mut tus: Vec<Vec<pp::PTok>> = Vec::new();
-    for f in &a.files {
+    let mut inputs = a.files.clone();
+    for l in &a.libs {
+        let names = [l.clone(), format!("{}.lib", l), format!("lib{}.lib", l)];
+        let found = a.libdirs.iter().chain(std::iter::once(&PathBuf::from("."))).flat_map(|d| names.iter().map(move |n| d.join(n))).find(|p| p.is_file());
+        match found {
+            Some(p) => {
+                let data = std::fs::read(&p).unwrap_or_default();
+                if data.starts_with(OBJ_MAGIC.as_bytes()) {
+                    inputs.push(p.to_string_lossy().into_owned());
+                }
+            }
+            None => {
+                // SDCC system libraries (mcs51, libsdcc, ...) are provided by the built-in runtime.
+            }
+        }
+    }
+    for f in &inputs {
         let path = Path::new(f);
         let data = std::fs::read(path).unwrap_or_else(|e| fail(format!("cannot read {}: {}", f, e)));
-        let toks = if data.starts_with(OBJ_MAGIC.as_bytes()) {
-            let text = String::from_utf8_lossy(&data[OBJ_MAGIC.len()..]).into_owned();
-            let mut pp = pp::Preprocessor::new(vec![], headers::get);
-            pp.preprocess_source(&text, path).unwrap_or_else(|e| fail(e))
-        } else if f.ends_with(".lib") || f.ends_with(".a") {
-            // Library: concatenated objects.
+        if data.starts_with(OBJ_MAGIC.as_bytes()) {
+            // Object file or library (concatenated objects).
             let text = String::from_utf8_lossy(&data).into_owned();
             for part in text.split(OBJ_MAGIC).filter(|p| !p.trim().is_empty()) {
                 let mut pp = pp::Preprocessor::new(vec![], headers::get);
+                pp.line_markers = true;
                 tus.push(pp.preprocess_source(part, path).unwrap_or_else(|e| fail(e)));
             }
             continue;
-        } else {
-            preprocess(&a, path).unwrap_or_else(|e| fail(e))
-        };
+        }
+        let toks = preprocess(&a, path).unwrap_or_else(|e| fail(e));
         tus.push(toks);
     }
     // Parse everything. If pointer address-space inference finds generic (3-byte) pointers, parse again
@@ -238,5 +368,7 @@ fn main() {
     if let Some(l) = &a.lst {
         std::fs::write(l, &out.listing).unwrap_or_else(|e| fail(e));
     }
-    eprintln!("code: {} bytes, ram: {:#04x}", out.code_size, out.ram_used);
+    if a.print_size {
+        eprintln!("code: {} bytes, ram: {:#04x}", out.code_size, out.ram_used);
+    }
 }
