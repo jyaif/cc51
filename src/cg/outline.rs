@@ -120,7 +120,9 @@ pub fn run(sections: &mut Vec<Section>, eligible: &[bool], globals: &HashSet<Rc<
         }
         // Evaluate candidates.
         let mut best: Option<(i64, Vec<Occ>, EndKind)> = None;
-        for ((_, span), occs) in table.iter() {
+        let mut keys: Vec<(&(u64, usize), &Vec<(usize, usize)>)> = table.iter().collect();
+        keys.sort_by_key(|(k, v)| (v[0], k.1, k.0));
+        for ((_, span), occs) in keys {
             if occs.len() < 2 {
                 continue;
             }
