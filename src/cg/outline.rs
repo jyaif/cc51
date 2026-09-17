@@ -204,7 +204,7 @@ pub fn run(sections: &mut Vec<Section>, eligible: &[bool], globals: &HashSet<Rc<
                 sections[si].items.splice(start..start + len, std::iter::once(Item::Insn(repl)));
             }
         }
-        sections.push(Section { name: name.clone(), items: body, org: None });
+        sections.push(Section { name: name.clone(), items: body, org: None, absolute: false });
         eligible.push(true);
         globals.insert(name);
         created += 1;

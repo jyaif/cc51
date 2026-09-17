@@ -84,6 +84,8 @@ pub struct Parser<'a> {
     scopes: Vec<Scope>,
     fctx: Option<FuncCtx>,
     nooverlay: bool,
+    /// `__at` seen inside a declarator (applies to the declared object).
+    pending_at: Option<u32>,
     /// ISO C mode (`#pragma std_cXX`): no SDCC-specific argument passing.
     iso_std: bool,
     pragma_stack: Vec<bool>,
@@ -111,6 +113,7 @@ pub fn parse_tu_ex(toks: Vec<Token>, prog: &mut Program, weak: bool) -> Result<(
         scopes: vec![Scope::default()],
         fctx: None,
         nooverlay: false,
+        pending_at: None,
         iso_std: false,
         pragma_stack: Vec::new(),
         anon_counter: 0,
@@ -280,6 +283,8 @@ impl<'a> Parser<'a> {
                     | Kw::Sfr16
                     | Kw::Sfr32
                     | Kw::At
+                    | Kw::Near
+                    | Kw::Far
                     | Kw::Banked
                     | Kw::Nonbanked
             ),
@@ -471,6 +476,9 @@ impl<'a> Parser<'a> {
 
     /// Parse SDCC function attributes and `__at` after a declarator.
     fn post_declarator_attrs(&mut self, spec: &mut DeclSpec) -> Result<()> {
+        if let Some(a) = self.pending_at.take() {
+            spec.at = Some(a);
+        }
         loop {
             match self.peek() {
                 Tok::Kw(Kw::At) => {
@@ -697,6 +705,8 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                         Kw::Data => q.space = Some(Space::Data),
+                        Kw::Near => q.space = Some(Space::Data),
+                        Kw::Far => q.space = Some(Space::Xdata),
                         Kw::Idata => q.space = Some(Space::Idata),
                         Kw::Xdata => q.space = Some(Space::Xdata),
                         Kw::Pdata => q.space = Some(Space::Pdata),
@@ -1121,9 +1131,9 @@ impl<'a> Parser<'a> {
                 Tok::Kw(Kw::Const) => q.is_const = true,
                 Tok::Kw(Kw::Volatile) => q.is_volatile = true,
                 Tok::Kw(Kw::Restrict) | Tok::Kw(Kw::Atomic) => {}
-                Tok::Kw(Kw::Data) => q.space = Some(Space::Data),
+                Tok::Kw(Kw::Data) | Tok::Kw(Kw::Near) => q.space = Some(Space::Data),
                 Tok::Kw(Kw::Idata) => q.space = Some(Space::Idata),
-                Tok::Kw(Kw::Xdata) => q.space = Some(Space::Xdata),
+                Tok::Kw(Kw::Xdata) | Tok::Kw(Kw::Far) => q.space = Some(Space::Xdata),
                 Tok::Kw(Kw::Pdata) => q.space = Some(Space::Pdata),
                 Tok::Kw(Kw::Code) => q.space = Some(Space::Code),
                 Tok::Kw(Kw::Attribute) => {
@@ -1147,6 +1157,11 @@ impl<'a> Parser<'a> {
             let q = self.pointer_quals()?;
             base = self.ptr_to(base);
             base.q = q;
+            // `char * __code __at(0x1234) p`: the address belongs to the declared object.
+            if self.is_kw(Kw::At) {
+                self.pos += 1;
+                self.pending_at = Some(self.at_address()?);
+            }
         }
         while self.is_kw(Kw::Attribute) {
             self.skip_attribute(None)?;

@@ -34,6 +34,8 @@ pub struct LayoutInput {
     pub callers: Vec<Vec<usize>>,
     /// Frames that are roots of interrupt contexts (placed above all main-context frames).
     pub isr_roots: Vec<usize>,
+    /// Internal RAM ranges taken by objects at fixed addresses.
+    pub reserved: Vec<(u32, u32)>,
 }
 
 pub struct LayoutResult {
@@ -97,9 +99,13 @@ pub fn layout(inp: &LayoutInput) -> Result<LayoutResult, String> {
             isr_ctx[f] = true;
         }
     }
+    // Physical bit numbers, skipping bytes taken by fixed-address objects.
+    let reserved_byte = |a: u32| inp.reserved.iter().any(|&(s, e)| a >= s && a < e);
+    let bit_nums: Vec<u32> = (0x20u32..0x30).filter(|b| !reserved_byte(*b)).flat_map(|b| (0..8).map(move |k| (b - 0x20) * 8 + k)).collect();
+    let bit_at = |i: u32| -> u32 { bit_nums.get(i as usize).copied().unwrap_or(u32::MAX) };
     let gbits = inp.global_bits.len() as u32;
     for (i, b) in inp.global_bits.iter().enumerate() {
-        syms.insert(b.clone(), i as i64);
+        syms.insert(b.clone(), bit_at(i as u32) as i64);
     }
     let mut bit_end_of = vec![0u32; n];
     let mut main_bits_end = gbits;
@@ -112,7 +118,7 @@ pub fn layout(inp: &LayoutInput) -> Result<LayoutResult, String> {
             b = b.max(bit_end_of[c]);
         }
         for (i, name) in inp.frames[f].bits.iter().enumerate() {
-            syms.insert(name.clone(), (b + i as u32) as i64);
+            syms.insert(name.clone(), bit_at(b + i as u32) as i64);
         }
         bit_end_of[f] = b + inp.frames[f].bits.len() as u32;
         main_bits_end = main_bits_end.max(bit_end_of[f]);
@@ -129,15 +135,16 @@ pub fn layout(inp: &LayoutInput) -> Result<LayoutResult, String> {
             }
         }
         for (i, name) in inp.frames[f].bits.iter().enumerate() {
-            syms.insert(name.clone(), (b + i as u32) as i64);
+            syms.insert(name.clone(), bit_at(b + i as u32) as i64);
         }
         bit_end_of[f] = b + inp.frames[f].bits.len() as u32;
         total_bits = total_bits.max(bit_end_of[f]);
     }
-    if total_bits > 128 {
+    if total_bits as usize > bit_nums.len() {
         return Err(format!("too many bit variables ({})", total_bits));
     }
-    let bit_bytes = (total_bits + 7) / 8;
+    // Bytes of the bit area actually used (fixed-address bytes inside it stay reserved).
+    let bit_bytes = if total_bits == 0 { 0 } else { bit_at(total_bits - 1) / 8 + 1 };
 
     // ---- Bytes ----
     let reg_end = 8 * inp.banks as u32;
@@ -151,7 +158,23 @@ pub fn layout(inp: &LayoutInput) -> Result<LayoutResult, String> {
     } else {
         segs.push((reg_end, top));
     }
-    let phys = Phys { segs };
+    // Exclude bytes taken by fixed-address objects.
+    let mut segs2: Vec<(u32, u32)> = Vec::new();
+    for (s, e) in segs {
+        let mut cur = s;
+        let mut cuts: Vec<(u32, u32)> = inp.reserved.iter().copied().filter(|&(rs, re)| re > s && rs < e).collect();
+        cuts.sort();
+        for (rs, re) in cuts {
+            if rs > cur {
+                segs2.push((cur, rs.min(e)));
+            }
+            cur = cur.max(re);
+        }
+        if cur < e {
+            segs2.push((cur, e));
+        }
+    }
+    let phys = Phys { segs: segs2 };
     let ram_top = inp.iram_size.min(0x100);
     // Upper RAM: globals first (top-down), then frames overlaid by call depth.
     let mut upper_used = 0u32;

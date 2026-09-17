@@ -67,6 +67,7 @@ keywords! {
     // SDCC
     Data = "__data", Idata = "__idata", Xdata = "__xdata", Pdata = "__pdata", Code = "__code",
     Bit = "__bit", Sbit = "__sbit", Sfr = "__sfr", Sfr16 = "__sfr16", Sfr32 = "__sfr32", At = "__at",
+    Near = "__near", Far = "__far",
     Interrupt = "__interrupt", Using = "__using", Naked = "__naked", Critical = "__critical",
     Reentrant = "__reentrant", AsmBegin = "__asm", AsmEnd = "__endasm", AsmFn = "__asm__",
     Banked = "__banked", Nonbanked = "__nonbanked", Wparam = "__wparam", Shadowregs = "__shadowregs",

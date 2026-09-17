@@ -10,6 +10,8 @@ pub struct Section {
     pub items: Vec<Item>,
     /// Fixed origin.
     pub org: Option<u32>,
+    /// Placed at an absolute address chosen by the program: other sections flow around it.
+    pub absolute: bool,
 }
 
 pub struct LinkOut {
@@ -77,6 +79,8 @@ fn relax(sections: &[&Section], mut syms: HashMap<Rc<str>, i64>, code_start: u32
         iterations += 1;
         // Assign addresses.
         let mut pc = code_start;
+        // Sections at a fixed address do not move the cursor of the relocatable ones.
+        let mut free_pc = code_start;
         let mut cur_sec = usize::MAX;
         for i in 0..n {
             let (si, it) = items[i];
@@ -84,10 +88,17 @@ fn relax(sections: &[&Section], mut syms: HashMap<Rc<str>, i64>, code_start: u32
             if *si != cur_sec {
                 if cur_sec != usize::MAX {
                     sec_bounds[cur_sec].1 = pc;
+                    if !sections[cur_sec].absolute {
+                        free_pc = pc;
+                    }
                 }
                 cur_sec = *si;
-                if let Some(org) = sections[*si].org {
-                    pc = org;
+                pc = match sections[*si].org {
+                    Some(org) => org,
+                    None => free_pc,
+                };
+                if !sections[*si].absolute {
+                    free_pc = pc;
                 }
                 sec_bounds[*si].0 = pc;
             }

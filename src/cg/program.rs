@@ -289,6 +289,12 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
         let mut reach_g: HashSet<usize> = HashSet::new();
         let mut runtime_used: HashSet<String> = HashSet::new();
         let mut work: Vec<crate::ast::Sym> = roots.iter().map(|f| crate::ast::Sym::Func(*f)).collect();
+        // Objects at a fixed address are reachable through that address.
+        for (g, gl) in prog.globals.iter().enumerate() {
+            if gl.at.is_some() && gl.init.is_some() {
+                work.push(crate::ast::Sym::Global(g));
+            }
+        }
         while let Some(s) = work.pop() {
             match s {
                 crate::ast::Sym::Global(g) => {
@@ -860,6 +866,9 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     let mut xdata_globals = Vec::new();
     let mut code_globals = Vec::new();
     let mut abs_syms: HashMap<Rc<str>, i64> = HashMap::new();
+    let mut abs_code_globals: Vec<(usize, u32)> = Vec::new();
+    let mut abs_ram_init: Vec<usize> = Vec::new();
+    let mut abs_xdata_init: Vec<usize> = Vec::new();
     let mut reach_g_sorted: Vec<usize> = reach_g.iter().copied().collect();
     reach_g_sorted.sort();
     for &g in &reach_g_sorted {
@@ -867,8 +876,15 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
         let name = gnames[g].clone();
         if let Some(a) = gl.at {
             abs_syms.insert(name.clone(), a as i64);
-            if gl.init.is_some() && gl.space != Space::Code {
-                crate::diag::warn(gl.loc, format!("initializer of '{}' at fixed address is ignored", gl.name));
+            if gl.init.is_some() {
+                match global_space(g) {
+                    // The initializer is placed at that ROM address.
+                    Space::Code => abs_code_globals.push((g, a)),
+                    // Written by the startup code.
+                    Space::Data | Space::Idata => abs_ram_init.push(g),
+                    Space::Xdata | Space::Pdata => abs_xdata_init.push(g),
+                    _ => crate::diag::warn(gl.loc, format!("initializer of '{}' at fixed address is ignored", gl.name)),
+                }
             }
             continue;
         }
@@ -973,7 +989,17 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
             banks = banks.max(u + 1);
         }
     }
-    let lay = match layout::layout(&LayoutInput { iram_size: opts.iram_size, banks, global_bits: global_bits.clone(), globals: globals_req.clone(), frames: frames.clone(), callers: callers.clone(), isr_roots }) {
+    // Internal RAM taken by objects at fixed addresses.
+    let reserved: Vec<(u32, u32)> = prog
+        .globals
+        .iter()
+        .enumerate()
+        .filter_map(|(g, gl)| match (gl.at, global_space(g)) {
+            (Some(a), Space::Data | Space::Idata) if a < 0x100 => Some((a, a + prog.global_size(g).max(1))),
+            _ => None,
+        })
+        .collect();
+    let lay = match layout::layout(&LayoutInput { reserved, iram_size: opts.iram_size, banks, global_bits: global_bits.clone(), globals: globals_req.clone(), frames: frames.clone(), callers: callers.clone(), isr_roots }) {
         Ok(l) => l,
         Err(e) => {
             let mut msg = format!("{}\n  globals: {} bytes", e, globals_req.iter().map(|g| g.size).sum::<u32>());
@@ -1005,7 +1031,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     let mut sections: Vec<Section> = Vec::new();
     let main_fid = roots.iter().copied().find(|&f| &*prog.funcs[f].name == "main").unwrap();
     let mut vec_items = vec![Item::Insn(crate::asm::Insn::new(Mn::Jmp, vec![Op::label(&"__start".into())]))];
-    sections.push(Section { name: "vector0".into(), items: std::mem::take(&mut vec_items), org: Some(opts.code_start) });
+    sections.push(Section { name: "vector0".into(), items: std::mem::take(&mut vec_items), org: Some(opts.code_start), absolute: false });
     let mut max_vec = 0u32;
     for &fid in &fids {
         if let Some(v) = funcs[fid].as_ref().unwrap().attrs.interrupt {
@@ -1018,6 +1044,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
                 name: format!("vector{}", v).into(),
                 items: vec![Item::Insn(crate::asm::Insn::new(Mn::Jmp, vec![Op::label(&fnames[fid])]))],
                 org: Some(addr),
+                absolute: false,
             });
         }
     }
@@ -1047,7 +1074,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     }
     // Initialized data.
     let mut init_moves = 0;
-    for &g in &ram_globals {
+    for &g in ram_globals.iter().chain(abs_ram_init.iter()) {
         let gl = &prog.globals[g];
         let Some(init) = &gl.init else { continue };
         let reloc_at: HashMap<u32, &crate::ast::Reloc> = init.relocs.iter().map(|r| (r.offset, r)).collect();
@@ -1103,7 +1130,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     }
     let _ = init_moves;
     // Xdata init.
-    for &g in &xdata_globals {
+    for &g in xdata_globals.iter().chain(abs_xdata_init.iter()) {
         let gl = &prog.globals[g];
         let size = prog.global_size(g);
         let mut bytes: Vec<Expr> = match &gl.init {
@@ -1150,7 +1177,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
         start.push(Item::Insn(crate::asm::Insn::new(Mn::Jmp, vec![Op::label(&fnames[main_fid])])));
     }
     let code_origin = (opts.code_start + 3).max(max_vec);
-    sections.push(Section { name: "startup".into(), items: start, org: Some(code_origin) });
+    sections.push(Section { name: "startup".into(), items: start, org: Some(code_origin), absolute: false });
     let nfixed = sections.len();
     // Functions: main first, then the rest (the order is optimized below).
     let mut order_codes: Vec<(usize, Vec<Item>)> = codes;
@@ -1160,7 +1187,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
         let f = funcs[fid].as_ref().unwrap();
         let has_asm = f.blocks.iter().any(|b| b.insts.iter().any(|x| matches!(x, Inst::Asm(_))));
         outline_ok.push(!has_asm && !f.attrs.naked);
-        sections.push(Section { name: fnames[fid].clone(), items, org: None });
+        sections.push(Section { name: fnames[fid].clone(), items, org: None, absolute: false });
     }
     // Runtime modules.
     for &mi in &rt_needed {
@@ -1168,7 +1195,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
         let mut p = AsmParser::new(&resolve, 0);
         p.label_prefix = format!("__rt{}", mi);
         let items = p.parse(&rt_mods[mi].text).map_err(|e| format!("runtime: {}", e))?;
-        sections.push(Section { name: format!("runtime{}", mi).into(), items, org: None });
+        sections.push(Section { name: format!("runtime{}", mi).into(), items, org: None, absolute: false });
     }
     // Procedural abstraction over functions and runtime code.
     outline_ok.resize(sections.len(), false);
@@ -1183,7 +1210,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     }
     // Constant data in code space.
     let mut const_items: Vec<Item> = Vec::new();
-    for &g in &code_globals {
+    for &g in code_globals.iter().chain(abs_code_globals.iter().map(|(g, _)| g)) {
         let gl = &prog.globals[g];
         let size = prog.global_size(g);
         let mut items = vec![Item::Label(gnames[g].clone())];
@@ -1209,11 +1236,17 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
             }
         }
         items.push(Item::Db(bytes));
-        const_items.extend(items);
+        match abs_code_globals.iter().find(|(x, _)| *x == g) {
+            Some(&(_, a)) => {
+                // The label is the absolute symbol; the section carries the bytes.
+                sections.push(Section { name: gnames[g].clone(), items: items.into_iter().skip(1).collect(), org: Some(a), absolute: true });
+            }
+            None => const_items.extend(items),
+        }
     }
     if !const_items.is_empty() {
         // One section keeps the objects in declaration order, as SDCC lays them out.
-        sections.push(Section { name: "__constdata".into(), items: const_items, org: None });
+        sections.push(Section { name: "__constdata".into(), items: const_items, org: None, absolute: false });
     }
     let nmovable = sections.len() - nfixed;
     let code_end = opts.code_start + opts.code_size;
