@@ -280,12 +280,25 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         .chain(fnames.iter().enumerate().map(|(i, n)| (n.clone(), crate::ast::Sym::Func(i))))
         .collect();
 
+    // IR parameter types of every function.
+    let ptys: Vec<Vec<Ty>> = prog
+        .funcs
+        .iter()
+        .map(|af| af.ftype().params.iter().map(|t| if t.is_scalar() { ir::build::ir_ty(prog, t) } else { Ty::I16 }).collect())
+        .collect();
+    let param_tys = |c: &Callee| -> Option<Vec<Ty>> {
+        match c {
+            Callee::Direct(f) => Some(ptys[*f].clone()),
+            _ => None,
+        }
+    };
+    let ocx = crate::opt::OptCtx { level: opts.opt, param_tys: &param_tys };
     // Optimize every function body once.
     for f in funcs.iter_mut().flatten() {
         if opts.dump_ir_raw {
             eprintln!("{}", ir::print::func(f));
         }
-        crate::opt::optimize_func(f, opts.opt);
+        crate::opt::optimize_func(f, &ocx);
     }
     let compute_reach = |funcs: &Vec<Option<Func>>| -> (HashSet<usize>, HashSet<usize>, HashSet<String>) {
         let mut reach_f: HashSet<usize> = HashSet::new();
@@ -370,8 +383,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<Output, String> {
         let order = bottom_up(&funcs, &reach_f0);
         let keep = |f: usize| roots.contains(&f) || prog.funcs[f].addr_taken;
         let is_inline = |f: usize| prog.funcs[f].is_inline;
-        let level = opts.opt;
-        crate::opt::inline::run(&mut funcs, &order, &keep, &is_inline, &|f: &mut Func| crate::opt::optimize_func(f, level));
+        crate::opt::inline::run(&mut funcs, &order, &keep, &is_inline, &|f: &mut Func| crate::opt::optimize_func(f, &ocx));
     }
     let (reach_f, reach_g, mut runtime_used) = compute_reach(&funcs);
     // Direct references to undefined functions are errors.
