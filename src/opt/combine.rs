@@ -323,6 +323,7 @@ fn simplify_inst(f: &Func, inf: &Info, ins: &Inst) -> Option<Inst> {
             let dt = f.ty(*d);
             match a {
                 Val::K(k) => Some(Inst::Copy(*d, Val::K(dt.norm(*k)))),
+                Val::Addr(..) if dt == Ty::I8 => Some(Inst::Copy(*d, *a)),
                 Val::R(s) => {
                     let st = f.ty(*s);
                     if st == dt {

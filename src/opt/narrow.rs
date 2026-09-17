@@ -296,7 +296,8 @@ fn conv(f: &mut Func, v: Val, want: Ty, out: &mut Vec<Inst>, signed: bool) -> Va
     match v {
         Val::K(k) => Val::K(want.norm(k)),
         Val::Addr(..) => {
-            if want == Ty::I16 {
+            // In 8-bit contexts an address constant stands for its low byte.
+            if want == Ty::I16 || want == Ty::I8 {
                 v
             } else if want.bits() < 16 {
                 let t = f.new_vreg(want);

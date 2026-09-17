@@ -235,6 +235,17 @@ pub fn propagate(f: &mut Func) -> bool {
         }
         let mut did = false;
         for (d, v) in work {
+            // An 8-bit vreg holding an address constant (its low byte) may only be substituted into
+            // same-width operations.
+            if matches!(v, Val::Addr(..)) && f.ty(d) != Ty::I16 {
+                let unsafe_use = f.blocks.iter().any(|b| {
+                    b.insts.iter().any(|i| i.uses().contains(&d) && !matches!(i, Inst::Bin(..) | Inst::Cmp(..) | Inst::Store(..) | Inst::Copy(..)))
+                        || (b.term.uses().contains(&d) && !matches!(b.term, Term::CmpBr(..)))
+                });
+                if unsafe_use {
+                    continue;
+                }
+            }
             // A constant used where an address operand is needed (e.g. CritExit) can't be substituted.
             if matches!(v, Val::K(_) | Val::Addr(..)) {
                 let used_by_crit = f.blocks.iter().any(|b| b.insts.iter().any(|i| *i == Inst::CritExit(d)));
