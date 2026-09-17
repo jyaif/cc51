@@ -486,3 +486,22 @@ char __fslt(unsigned long a, unsigned long b) {
   if (a == b) return 0;
   return (a < b) != neg;
 }
+
+/* ---- ctype ---- */
+
+int isdigit(int c) { return (unsigned char)(c - '0') < 10; }
+int isupper(int c) { return (unsigned char)(c - 'A') < 26; }
+int islower(int c) { return (unsigned char)(c - 'a') < 26; }
+int isalpha(int c) { return (unsigned char)((c | 0x20) - 'a') < 26; }
+int isalnum(int c) { return isalpha(c) || isdigit(c); }
+int isxdigit(int c) { return isdigit(c) || (unsigned char)((c | 0x20) - 'a') < 6; }
+int isspace(int c) { return c == ' ' || (unsigned char)(c - '\t') < 5; }
+int isblank(int c) { return c == ' ' || c == '\t'; }
+int isprint(int c) { return (unsigned char)(c - ' ') < 95; }
+int isgraph(int c) { return (unsigned char)(c - '!') < 94; }
+int iscntrl(int c) { return (unsigned char)c < 32 || c == 127; }
+int ispunct(int c) { return isgraph(c) && !isalnum(c); }
+int isascii(int c) { return (unsigned char)c < 128; }
+int toascii(int c) { return c & 0x7f; }
+int toupper(int c) { return islower(c) ? c - 32 : c; }
+int tolower(int c) { return isupper(c) ? c + 32 : c; }

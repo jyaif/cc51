@@ -37,6 +37,8 @@ pub struct Cpu {
     pub serial: Vec<u8>,
     /// Interrupt in progress (priority levels: bit0 low, bit1 high).
     in_isr: u8,
+    /// One instruction must execute after RETI before the next interrupt is serviced.
+    isr_delay: bool,
     pub trace: bool,
     pub stop_on_self_loop: bool,
     pub max_sp: u8,
@@ -58,7 +60,7 @@ impl Cpu {
         for p in [0x80u8, 0x90, 0xA0, 0xB0] {
             st.sfr[(p - 0x80) as usize] = 0xff;
         }
-        Cpu { st, rom, xram: vec![0; 0x10000], halted: false, halt_reason: String::new(), serial: Vec::new(), in_isr: 0, trace: false, stop_on_self_loop: true, max_sp: 7 }
+        Cpu { st, rom, xram: vec![0; 0x10000], halted: false, halt_reason: String::new(), serial: Vec::new(), in_isr: 0, isr_delay: false, trace: false, stop_on_self_loop: true, max_sp: 7 }
     }
 
     pub fn load_hex(text: &str) -> Result<Vec<u8>, String> {
@@ -301,11 +303,30 @@ impl Cpu {
                 self.st.sfr[(0x88 - 0x80) as usize] |= if t == 0 { 0x20 } else { 0x80 };
             }
         }
+        // Timer 2 (8052): 16-bit auto-reload from RCAP2H:RCAP2L.
+        let t2con = self.st.sfr[(0xC8 - 0x80) as usize];
+        if t2con & 0x04 != 0 {
+            let mut v = ((self.st.sfr[(0xCD - 0x80) as usize] as u32) << 8) | self.st.sfr[(0xCC - 0x80) as usize] as u32;
+            let reload = ((self.st.sfr[(0xCB - 0x80) as usize] as u32) << 8) | self.st.sfr[(0xCA - 0x80) as usize] as u32;
+            for _ in 0..n {
+                v += 1;
+                if v > 0xffff {
+                    v = reload;
+                    self.st.sfr[(0xC8 - 0x80) as usize] |= 0x80; // TF2
+                }
+            }
+            self.st.sfr[(0xCC - 0x80) as usize] = v as u8;
+            self.st.sfr[(0xCD - 0x80) as usize] = (v >> 8) as u8;
+        }
     }
 
     fn interrupts(&mut self) {
         let ie = self.st.sfr[(0xA8 - 0x80) as usize];
         if ie & 0x80 == 0 || self.in_isr != 0 {
+            return;
+        }
+        if self.isr_delay {
+            self.isr_delay = false;
             return;
         }
         let tcon = self.st.sfr[(0x88 - 0x80) as usize];
@@ -319,6 +340,9 @@ impl Cpu {
             vec = Some(0x1B);
         } else if ie & 0x10 != 0 && scon & 0x03 != 0 {
             vec = Some(0x23);
+        } else if ie & 0x20 != 0 && self.st.sfr[(0xC8 - 0x80) as usize] & 0xc0 != 0 {
+            // Timer 2: the flags are cleared by software.
+            vec = Some(0x2B);
         }
         if let Some(v) = vec {
             let pc = self.st.pc;
@@ -470,6 +494,7 @@ impl Cpu {
                 let lo = self.pop();
                 self.st.pc = ((hi as u16) << 8) | lo as u16;
                 self.in_isr = 0;
+                self.isr_delay = true;
                 cyc = 2;
             }
             0x24 | 0x34 | 0x94 => {

@@ -652,6 +652,18 @@ impl<'a> Builder<'a> {
             self.emit(Inst::Cmp(Cond::Ne, t, v, z, ft));
             return Ok(Val::R(t));
         }
+        // A pointer converted to an integer wider than a pointer goes through its generic form (SDCC).
+        if from.is_pointer() && !from.is_func_ptr() && to.is_integer() && tt.bytes() > 2 && ft == Ty::I16 {
+            // An inferred data pointer may hold a plain integer, which SDCC leaves untagged.
+            let pinned = from.space_var().map_or(false, |v| self.prog.spaces.is_pinned(v));
+            let space = self.prog.ptr_space(from);
+            let tag = match space {
+                Some(Space::Data) | Some(Space::Idata) if !pinned => 0,
+                s => s.map_or(0x40, |s| s.gptr_tag()),
+            };
+            let g = self.make_gptr(v, tag);
+            return Ok(self.resize(g, Ty::I24, tt, false));
+        }
         // Pointer conversions between generic and specific.
         if from.is_pointer() && to.is_pointer() && ft != tt {
             if tt == Ty::I24 {

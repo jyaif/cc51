@@ -1768,7 +1768,7 @@ impl<'a> Gen<'a> {
                     self.load_a(&s0);
                     // Pointer setup must not clobber A.
                     let saved = self.st.a.clone();
-                    let needs_a = matches!(m, Mem::Ptr(Val::R(pr), _, _) if self.fold.kind[*pr as usize] == FoldKind::PtrIdx);
+                    let needs_a = self.rptr_setup_needs_a(m);
                     if needs_a {
                         self.e2(Mn::Mov, Op::dir(B_DIR), Op::A);
                         self.uses_b = true;
@@ -1852,6 +1852,14 @@ impl<'a> Gen<'a> {
             // Writes to code space have no effect.
             PSpace::S(Space::Code) => {}
             PSpace::S(s) => panic!("store to space {:?} in {}", s, self.f.name),
+        }
+    }
+
+    /// Does computing the @Ri pointer for `m` go through A?
+    fn rptr_setup_needs_a(&self, m: &Mem) -> bool {
+        match m {
+            Mem::Ptr(Val::R(pr), off, _) => self.fold.kind[*pr as usize] != FoldKind::None || !(0..=3).contains(off),
+            _ => false,
         }
     }
 
