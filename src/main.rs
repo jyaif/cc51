@@ -19,6 +19,8 @@ const USAGE: &str = "usage: cc51 [options] files...
   --lst <file>       write a listing file
   --dump-ir          print optimized IR and allocation
   --size             print code size and RAM usage
+  --float=fast|small floating point routines: fast (default) or smaller and slower;
+                     both give the same results (--opt-code-size and -Os select small)
   -w                 disable warnings
 Accepts SDCC-style options (-mmcs51, --std-*, --model-small) for compatibility.";
 
@@ -37,6 +39,8 @@ struct Args {
     print_size: bool,
     /// `--std-cXX` (ISO) or `--std-sdccXX` (SDCC extensions) selected on the command line.
     std_pragma: Option<&'static str>,
+    /// `--float` was given explicitly (it then overrides `--opt-code-size`).
+    float_set: bool,
 }
 
 fn parse_num(s: &str) -> u32 {
@@ -68,6 +72,7 @@ fn parse_args() -> Args {
         lst: None,
         print_size: false,
         std_pragma: None,
+        float_set: false,
     };
     let mut i = 0;
     while i < argv.len() {
@@ -88,7 +93,28 @@ fn parse_args() -> Args {
             "-c" => a.compile_only = true,
             "-E" => a.preprocess_only = true,
             "-O0" => a.opts.opt = 0,
-            "-O" | "-O1" | "-O2" | "-Os" | "-O3" | "--opt-code-size" | "--opt-code-speed" => a.opts.opt = 2,
+            "-O" | "-O1" | "-O2" | "-O3" | "--opt-code-speed" => a.opts.opt = 2,
+            "-Os" | "--opt-code-size" => {
+                a.opts.opt = 2;
+                if !a.float_set {
+                    a.opts.small_float = true;
+                }
+            }
+            _ if s == "--float" || s.starts_with("--float=") => {
+                let v = match s.split_once('=') {
+                    Some((_, v)) => v.to_string(),
+                    None => next(),
+                };
+                a.opts.small_float = match v.as_str() {
+                    "fast" => false,
+                    "small" => true,
+                    _ => {
+                        eprintln!("cc51: --float takes 'small' or 'fast'");
+                        exit(1)
+                    }
+                };
+                a.float_set = true;
+            }
             "--code-loc" => a.opts.code_start = parse_num(&next()),
             "--code-size" => a.opts.code_size = parse_num(&next()),
             "--iram-size" => a.opts.iram_size = parse_num(&next()),

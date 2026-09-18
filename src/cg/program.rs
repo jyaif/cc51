@@ -24,11 +24,13 @@ pub struct Options {
     pub dump_ir: bool,
     pub dump_ir_raw: bool,
     pub verbose: bool,
+    /// Link the size-optimized floating point routines instead of the fast ones.
+    pub small_float: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { opt: 2, code_start: 0, code_size: 0x10000, iram_size: 256, xram_start: 0, xram_size: 0x10000, dump_ir: false, dump_ir_raw: false, verbose: false }
+        Options { opt: 2, code_start: 0, code_size: 0x10000, iram_size: 256, xram_start: 0, xram_size: 0x10000, dump_ir: false, dump_ir_raw: false, verbose: false, small_float: false }
     }
 }
 
@@ -48,15 +50,26 @@ struct RtModule {
     text: String,
 }
 
-fn runtime_modules() -> Vec<RtModule> {
+/// Runtime modules. A module tagged `fast` or `small` (`;;; module <name> small`) is one of two
+/// variants of the same routines; only the variant selected by `small_float` is available.
+fn runtime_modules(small_float: bool) -> Vec<RtModule> {
     let mut mods = Vec::new();
     let mut cur: Option<RtModule> = None;
+    let mut skip = false;
     for line in RUNTIME.lines() {
-        if let Some(_name) = line.strip_prefix(";;; module ") {
+        if let Some(rest) = line.strip_prefix(";;; module ") {
             if let Some(m) = cur.take() {
                 mods.push(m);
             }
-            cur = Some(RtModule { labels: vec![], text: String::new() });
+            skip = match rest.split_whitespace().nth(1) {
+                Some("small") => !small_float,
+                Some("fast") => small_float,
+                _ => false,
+            };
+            cur = (!skip).then(|| RtModule { labels: vec![], text: String::new() });
+            continue;
+        }
+        if skip {
             continue;
         }
         if let Some(m) = cur.as_mut() {
@@ -410,7 +423,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
     for &fid in &reach_f {
         if funcs[fid].is_none() {
             let name = &prog.funcs[fid].name;
-            let known_rt = runtime_modules().iter().any(|m| m.labels.iter().any(|l| l == &format!("_{}", name)));
+            let known_rt = runtime_modules(opts.small_float).iter().any(|m| m.labels.iter().any(|l| l == &format!("_{}", name)));
             if !known_rt {
                 return Err(format!("undefined reference to '{}'", name));
             }
@@ -586,7 +599,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
             summaries[fid] = Some(Summary { params: p, ret: r, clobbers: ALL_REGS, keeps_b: false, keeps_dptr: false });
         }
     }
-    let rt_label_set: HashSet<Rc<str>> = runtime_modules().iter().flat_map(|m| m.labels.iter().map(|l| Rc::from(l.as_str()))).collect();
+    let rt_label_set: HashSet<Rc<str>> = runtime_modules(opts.small_float).iter().flat_map(|m| m.labels.iter().map(|l| Rc::from(l.as_str()))).collect();
     let mut codes: Vec<(usize, Vec<Item>)> = Vec::new();
     let (mut iargs_bytes, mut iargs_bits) = (0u32, 0u16);
     let mut frames: Vec<FrameReq> = vec![FrameReq::default(); n];
@@ -938,7 +951,7 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
         globals_req.push(RamObj { sym: super::frame_obj_sym(super::IARGS, 0), size: iargs_bytes, upper: false });
     }
     // Runtime scratch RAM.
-    let rt_mods = runtime_modules();
+    let rt_mods = runtime_modules(opts.small_float);
     let rt_labels: HashSet<&str> = rt_mods.iter().flat_map(|m| m.labels.iter().map(|l| l.as_str())).collect();
     let mut rt_needed: Vec<usize> = Vec::new();
     {
@@ -998,10 +1011,13 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
                 if m.labels.iter().any(|l| runtime_used.contains(l)) {
                     rt_needed.push(mi);
                     changed = true;
-                    // References from this module.
-                    for w in m.text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-                        if w.starts_with("__") {
-                            runtime_used.insert(w.to_string());
+                    // References from this module (outside comments).
+                    for line in m.text.lines() {
+                        let code = line.split(';').next().unwrap_or("");
+                        for w in code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                            if w.starts_with("__") {
+                                runtime_used.insert(w.to_string());
+                            }
                         }
                     }
                 }
