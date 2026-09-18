@@ -901,7 +901,15 @@ impl<'a> Parser<'a> {
                 if &*name == "__func__" || &*name == "__FUNCTION__" {
                     let fname = self.fctx.as_ref().map(|c| self.prog.funcs[c.id].name.to_string()).unwrap_or_default();
                     let g = self.string_global(fname.as_bytes(), 1);
-                    let ty = self.prog.globals[g].ty.clone();
+                    // __func__ has type const char[] (unlike a string literal).
+                    let ty = match &self.prog.globals[g].ty.kind {
+                        TypeKind::Array(e, n) => {
+                            let mut e = (**e).clone();
+                            e.q.is_const = true;
+                            Type::new(TypeKind::Array(Rc::new(e), *n))
+                        }
+                        _ => self.prog.globals[g].ty.clone(),
+                    };
                     return Ok(Expr::new(ExprKind::Global(g), ty, loc));
                 }
                 match self.lookup(&name).cloned() {
@@ -1098,13 +1106,12 @@ impl<'a> Parser<'a> {
             let t = self.type_name()?;
             self.expect_p(":")?;
             let e = self.assign()?;
-            // Pointer types also have to agree on their target space.
-            let same_space = match (t.space_var(), cty.space_var()) {
-                (Some(a), Some(b)) => {
-                    let sp = |v| self.prog.spaces.is_pinned(v).then(|| self.prog.spaces.resolve(v)).flatten();
-                    sp(a) == sp(b)
-                }
-                _ => true,
+            // An association that names an address space only matches that space; one that names
+            // none matches whatever space the controlling expression happens to have (SDCC).
+            let sp = |v| self.prog.spaces.is_pinned(v).then(|| self.prog.spaces.resolve(v)).flatten();
+            let same_space = match t.space_var().and_then(&sp) {
+                Some(a) => cty.space_var().and_then(&sp) == Some(a),
+                None => true,
             };
             if chosen.is_none() && same_space && t.same(&cty) && t.is_integer() == cty.is_integer() && t.is_signed() == cty.is_signed() {
                 chosen = Some(e);

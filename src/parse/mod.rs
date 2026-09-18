@@ -131,6 +131,23 @@ pub fn parse_tu_ex(toks: Vec<Token>, prog: &mut Program, weak: bool) -> Result<(
     Ok(())
 }
 
+/// Keywords that only qualify a type (they can precede `*` in a declarator).
+fn is_qual_kw(t: &Tok) -> bool {
+    matches!(
+        t,
+        Tok::Kw(Kw::Const)
+            | Tok::Kw(Kw::Volatile)
+            | Tok::Kw(Kw::Restrict)
+            | Tok::Kw(Kw::Data)
+            | Tok::Kw(Kw::Near)
+            | Tok::Kw(Kw::Idata)
+            | Tok::Kw(Kw::Xdata)
+            | Tok::Kw(Kw::Far)
+            | Tok::Kw(Kw::Pdata)
+            | Tok::Kw(Kw::Code)
+    )
+}
+
 impl<'a> Parser<'a> {
     fn builtin_typedefs(&mut self) {
         let va = Type::new(TypeKind::Pointer(Rc::new(Type::uchar()), self.prog.spaces.new_var(None)));
@@ -1157,8 +1174,18 @@ impl<'a> Parser<'a> {
 
     /// Returns (type, name, loc, function attributes, parameter names of the outermost function declarator).
     fn declarator_full(&mut self, mut base: Type) -> Result<(Type, Option<Rc<str>>, Loc, FuncAttrs, Option<Vec<(Option<Rc<str>>, Type, Loc)>>)> {
-        while self.eat_p("*") {
-            let q = self.pointer_quals()?;
+        loop {
+            // SDCC also allows the qualifiers before the star: `char (__code * p)`.
+            let save = self.pos;
+            let pre = if is_qual_kw(self.peek()) { self.pointer_quals()? } else { Quals::default() };
+            if !self.eat_p("*") {
+                self.pos = save;
+                break;
+            }
+            let mut q = self.pointer_quals()?;
+            q.is_const |= pre.is_const;
+            q.is_volatile |= pre.is_volatile;
+            q.space = q.space.or(pre.space);
             base = self.ptr_to(base);
             base.q = q;
             // `char * __code __at(0x1234) p`: the address belongs to the declared object.
@@ -1210,6 +1237,10 @@ impl<'a> Parser<'a> {
     fn paren_starts_params(&self) -> bool {
         // Called when at '('. It starts a parameter list if followed by ')' or a type name.
         let t = self.peek_at(1);
+        // `(__code *)`: a qualifier right before '*' belongs to a nested pointer declarator.
+        if is_qual_kw(t) && matches!(self.peek_at(2), Tok::Punct("*")) {
+            return false;
+        }
         matches!(t, Tok::Punct(")")) || (self.is_typename_tok(t) && !matches!(t, Tok::Kw(Kw::Attribute))) || matches!(t, Tok::Punct("..."))
     }
 
@@ -1536,6 +1567,11 @@ impl<'a> Parser<'a> {
             let f = &self.prog.funcs[fid];
             let old = f.ty.clone();
             if !self.prog.compatible(&old, &ty) {
+                if self.weak {
+                    // The program redefines a library function with another signature: its own
+                    // definition owns the name, and the library one becomes unreferenced.
+                    return Ok(self.add_func_entry(name, ty, loc, spec, false));
+                }
                 return err(loc, format!("conflicting types for '{}'", name));
             }
             self.unify(&old, &ty);
@@ -1834,7 +1870,7 @@ impl<'a> Parser<'a> {
             4 => Type::ulong(),
             _ => Type::char(),
         };
-        elem.q.is_const = true;
+        // A string literal has type char[] (not const), but lives in code space.
         elem.q.space = Some(Space::Code);
         let ty = Type::new(TypeKind::Array(Rc::new(elem), Some(data.len() as u32 / width as u32)));
         self.prog.globals.push(Global {
