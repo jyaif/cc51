@@ -6,6 +6,7 @@ pub mod combine;
 pub mod dataflow;
 pub mod dce;
 pub mod inline;
+pub mod loops;
 pub mod narrow;
 
 use crate::ir::{Callee, Func, Ty};
@@ -42,6 +43,10 @@ pub fn optimize_func(f: &mut Func, cx: &OptCtx) {
         if !changed {
             changed |= narrow::run(f, cx.param_tys);
             verify(f, "narrow");
+        }
+        if !changed {
+            changed |= loops::run(f);
+            verify(f, "loops");
         }
         if !changed {
             break;
