@@ -97,3 +97,120 @@ pub fn run(f: &mut Func) -> bool {
     }
     changed
 }
+
+/// Where the counter of a loop is used, to decide whether the loop can count over an offset value.
+enum Use {
+    /// `d = v + base`: the value the loop really walks over.
+    Offset(BlockId, usize, VReg),
+    /// The step in the latch, and the latch comparison.
+    Step,
+    Test,
+}
+
+/// Replace a loop counter with the value it is always offset by: `a[i]` becomes a pointer walk,
+/// which drops an addition (and often a register) from every iteration.
+pub fn reduce(f: &mut Func) -> bool {
+    let idom = dominators(f);
+    let preds = f.preds();
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        let Term::CmpBr(cond, a, b, ty, t, e) = f.blocks[bi].term else { continue };
+        let (Val::R(v), Val::K(k)) = (a, b) else { continue };
+        // Only an inequality test keeps its meaning when the counter is shifted.
+        let header = match cond {
+            Cond::Ne if dominates(&idom, t, bi as u32) => t,
+            Cond::Eq if dominates(&idom, e, bi as u32) => e,
+            _ => continue,
+        };
+        let body = loop_blocks(f, &preds, header, bi as u32);
+        if preds[header as usize].iter().filter(|p| !body.contains(p)).count() != 1 {
+            continue;
+        }
+        if !counts_to_ne(f, &body, bi as u32, v) {
+            continue;
+        }
+        // Every use of the counter must be the same offset from it.
+        let mut base: Option<Val> = None;
+        let mut uses: Vec<Use> = Vec::new();
+        let mut ok = true;
+        for (xb, blk) in f.blocks.iter().enumerate() {
+            let inside = body.contains(&(xb as u32));
+            for (xi, ins) in blk.insts.iter().enumerate() {
+                if !ins.uses().contains(&v) {
+                    continue;
+                }
+                match ins {
+                    Inst::Bin(BinK::Add, d, Val::R(s), off) if *s == v && inside && *d != v => {
+                        if base.get_or_insert(*off) != off {
+                            ok = false;
+                        }
+                        uses.push(Use::Offset(xb as u32, xi, *d));
+                    }
+                    Inst::Bin(BinK::Add, d, Val::R(s), Val::K(1)) if *s == v && *d == v => uses.push(Use::Step),
+                    _ => ok = false,
+                }
+            }
+            if blk.term.uses().contains(&v) {
+                if xb == bi {
+                    uses.push(Use::Test);
+                } else {
+                    ok = false;
+                }
+            }
+        }
+        let Some(base) = base.filter(|_| ok) else { continue };
+        // The starting values and the bound move by the same offset.
+        let shift = |val: i64| -> Option<Val> {
+            Some(match base {
+                Val::K(c) => Val::K(ty.norm(val.wrapping_add(c))),
+                Val::Addr(s, o) => Val::Addr(s, o + val as i32),
+                Val::R(_) => return None,
+            })
+        };
+        if shift(0).is_none() {
+            continue;
+        }
+        for blk in f.blocks.iter_mut() {
+            for ins in blk.insts.iter_mut() {
+                if let Inst::Copy(d, Val::K(c)) = ins {
+                    if *d == v {
+                        *ins = Inst::Copy(v, shift(*c).unwrap());
+                    }
+                }
+            }
+        }
+        for u in uses {
+            if let Use::Offset(xb, xi, d) = u {
+                f.blocks[xb as usize].insts[xi] = Inst::Copy(d, Val::R(v));
+            }
+        }
+        f.blocks[bi].term = Term::CmpBr(cond, a, shift(k).unwrap(), ty, t, e);
+        changed = true;
+    }
+    changed
+}
+
+/// The counter of an inequality-tested loop: stepped by one in the latch, started outside it.
+fn counts_to_ne(f: &Func, body: &[BlockId], latch: BlockId, v: VReg) -> bool {
+    let mut steps = 0;
+    for (bi, b) in f.blocks.iter().enumerate() {
+        let inside = body.contains(&(bi as u32));
+        for ins in &b.insts {
+            if ins.def() != Some(v) {
+                continue;
+            }
+            if inside {
+                if bi as u32 != latch || !matches!(ins, Inst::Bin(BinK::Add, d, Val::R(s), Val::K(1)) if *d == v && *s == v) {
+                    return false;
+                }
+                steps += 1;
+            } else if !matches!(ins, Inst::Copy(_, Val::K(_))) {
+                return false;
+            }
+        }
+    }
+    if f.params.iter().any(|p| matches!(p, ParamLoc::Reg(r) if *r == v)) {
+        return false;
+    }
+    steps == 1
+}

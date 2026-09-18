@@ -47,6 +47,8 @@ pub fn optimize_func(f: &mut Func, cx: &OptCtx) {
         if !changed {
             changed |= loops::run(f);
             verify(f, "loops");
+            changed |= loops::reduce(f);
+            verify(f, "loop strength reduction");
         }
         if !changed {
             break;
