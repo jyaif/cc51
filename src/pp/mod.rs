@@ -220,6 +220,14 @@ impl Preprocessor {
             if tok.kind == PKind::Ident && self.expand_macro(&tok)? {
                 continue;
             }
+            if tok.kind == PKind::AsmBlock {
+                // Conditional directives inside an assembly block are still the preprocessor's.
+                let mut tok = tok;
+                let text = self.filter_asm(&tok.text, tok.loc)?;
+                tok.text = text.into();
+                out.push(tok);
+                continue;
+            }
             out.push(tok);
         }
         Ok(())
@@ -235,6 +243,75 @@ impl Preprocessor {
             v.push(self.input.pop().unwrap());
         }
         v
+    }
+
+    /// Evaluate conditional directives inside an `__asm` block, whose body is kept as raw text.
+    fn filter_asm(&mut self, text: &str, loc: Loc) -> Result<String> {
+        if !text.lines().any(|l| l.trim_start().starts_with('#')) {
+            return Ok(text.to_string());
+        }
+        // (emitting, a branch was taken, the enclosing level is emitting)
+        let mut stack: Vec<(bool, bool, bool)> = Vec::new();
+        let emitting = |st: &Vec<(bool, bool, bool)>| st.last().map_or(true, |t| t.0);
+        let mut out = String::new();
+        for line in text.lines() {
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix('#') else {
+                if emitting(&stack) {
+                    out.push_str(line);
+                }
+                out.push('\n');
+                continue;
+            };
+            let rest = rest.trim();
+            let (word, arg) = match rest.find(char::is_whitespace) {
+                Some(p) => (&rest[..p], rest[p..].trim()),
+                None => (rest, ""),
+            };
+            let parent = emitting(&stack);
+            match word {
+                "if" | "ifdef" | "ifndef" | "elif" => {
+                    let cond = if !parent && word != "elif" {
+                        false
+                    } else {
+                        match word {
+                            "ifdef" => self.macros.contains_key(arg),
+                            "ifndef" => !self.macros.contains_key(arg),
+                            _ => {
+                                let toks = lexer::tokenize(&format!("{}\n", arg), loc.file)?;
+                                let toks: Vec<PTok> = toks.into_iter().filter(|t| t.kind != PKind::Eof).collect();
+                                self.eval_cond(&mk(PKind::Ident, word, loc), toks)?
+                            }
+                        }
+                    };
+                    if word == "elif" {
+                        let Some(top) = stack.last_mut() else { return err(loc, "#elif without #if in assembly block") };
+                        top.0 = top.2 && !top.1 && cond;
+                        top.1 |= top.0;
+                    } else {
+                        stack.push((parent && cond, parent && cond, parent));
+                    }
+                }
+                "else" => {
+                    let Some(top) = stack.last_mut() else { return err(loc, "#else without #if in assembly block") };
+                    top.0 = top.2 && !top.1;
+                    top.1 = true;
+                }
+                "endif" => {
+                    if stack.pop().is_none() {
+                        return err(loc, "#endif without #if in assembly block");
+                    }
+                }
+                _ => {
+                    if emitting(&stack) {
+                        out.push_str(line);
+                    }
+                }
+            }
+            // Keep the line count so that listings and errors still line up.
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     fn directive(&mut self, hash: PTok) -> Result<()> {

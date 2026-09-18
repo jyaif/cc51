@@ -61,7 +61,7 @@ keywords! {
     Union = "union", Unsigned = "unsigned", Void = "void", Volatile = "volatile", While = "while",
     Bool = "_Bool", Alignas = "_Alignas", Alignof = "_Alignof", Noreturn = "_Noreturn",
     StaticAssert = "_Static_assert", Generic = "_Generic", ThreadLocal = "_Thread_local",
-    Complex = "_Complex", Atomic = "_Atomic",
+    Complex = "_Complex", Atomic = "_Atomic", BitInt = "_BitInt",
     // GNU
     Typeof = "typeof", Attribute = "__attribute__", Extension = "__extension__", BuiltinOffsetof = "__builtin_offsetof",
     BuiltinVaArg = "__builtin_va_arg",

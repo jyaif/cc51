@@ -658,6 +658,8 @@ impl<'a> Parser<'a> {
         let mut at = None;
         let mut fattrs = FuncAttrs::default();
         let mut special = None;
+        // `_BitInt(N)` without signed/unsigned is signed, even where plain char is not.
+        let mut bitint = false;
         #[derive(Default)]
         struct C {
             void: u8,
@@ -751,6 +753,24 @@ impl<'a> Parser<'a> {
                             c.other += 1;
                             explicit = Some(Type::bit());
                         }
+                        Kw::BitInt => {
+                            // A bit-precise integer uses the smallest standard type that holds it.
+                            self.pos += 1;
+                            self.expect_p("(")?;
+                            let w = self.const_int_expr()?;
+                            self.expect_p(")")?;
+                            if w < 1 || w > 64 {
+                                return err(self.loc(), "unsupported _BitInt width");
+                            }
+                            match w {
+                                1..=8 => c.char_ += 1,
+                                9..=16 => c.int += 1,
+                                17..=32 => c.long += 1,
+                                _ => c.long += 2,
+                            }
+                            bitint = true;
+                            continue;
+                        }
                         Kw::Bit => c.bit += 1,
                         Kw::Void => c.void += 1,
                         Kw::Bool => c.bool_ += 1,
@@ -820,7 +840,7 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
         }
-        let signed = c.signed > 0;
+        let signed = c.signed > 0 || (bitint && c.unsigned == 0);
         let unsigned = c.unsigned > 0;
         if signed && unsigned {
             return err(loc, "both 'signed' and 'unsigned' in declaration specifiers");
