@@ -694,14 +694,12 @@ impl<'a> Builder<'a> {
             return Ok(Val::R(t));
         }
         // A pointer converted to an integer wider than a pointer goes through its generic form (SDCC).
-        if from.is_pointer() && !from.is_func_ptr() && to.is_integer() && tt.bytes() > 2 && ft == Ty::I16 {
-            // An inferred data pointer may hold a plain integer, which SDCC leaves untagged.
-            let pinned = from.space_var().map_or(false, |v| self.prog.spaces.is_pinned(v));
-            let space = self.prog.ptr_space(from);
-            let tag = match space {
-                Some(Space::Data) | Some(Space::Idata) if !pinned => 0,
-                s => s.map_or(0x40, |s| s.gptr_tag()),
-            };
+        if from.is_pointer() && !from.is_func_ptr() && to.is_integer() && tt.bytes() > 2 && ft.bytes() <= 2 {
+            // A pointer whose target space nothing pinned down carries no tag (SDCC leaves the
+            // high byte of such a conversion zero).
+            let unknown = from.space_var().map_or(true, |v| self.prog.spaces.is_unconstrained(v));
+            let tag = if unknown { 0 } else { self.prog.ptr_space(from).map_or(0, |s| s.gptr_tag()) };
+            let v = self.resize(v, ft, Ty::I16, false);
             let g = self.make_gptr(v, tag);
             return Ok(self.resize(g, Ty::I24, tt, false));
         }
@@ -717,10 +715,15 @@ impl<'a> Builder<'a> {
             return Ok(self.resize(v, ft, tt, false));
         }
         if from.is_integer() && to.is_pointer() && tt == Ty::I24 {
-            // Integer to generic pointer: tag from the pointee's declared space if any.
-            let tag = to.pointee().and_then(|p| p.q.space).map(|s| s.gptr_tag()).unwrap_or(0x40);
-            let v16 = self.resize(v, ft, Ty::I16, from.is_signed());
-            return Ok(self.make_gptr(v16, tag));
+            // Integer to generic pointer: tag from the pointee's declared space, or, with no
+            // declared space, whatever the integer itself holds there (SDCC).
+            match to.pointee().and_then(|p| p.q.space) {
+                Some(s) => {
+                    let v16 = self.resize(v, ft, Ty::I16, from.is_signed());
+                    return Ok(self.make_gptr(v16, s.gptr_tag()));
+                }
+                None => return Ok(self.resize(v, ft, tt, false)),
+            }
         }
         if let (Val::Addr(s, o), Ty::I8) = (v, tt) {
             let t = self.tmp(Ty::I8);

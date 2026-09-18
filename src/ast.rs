@@ -343,6 +343,10 @@ impl SpaceSolver {
             }
         }
     }
+    /// True when nothing constrained this pointer's target space.
+    pub fn is_unconstrained(&self, v: SpaceVar) -> bool {
+        self.spaces[self.find_const(v) as usize].is_empty()
+    }
     pub fn is_generic(&self, v: SpaceVar) -> bool {
         if self.generic_hint.contains(&v) {
             return true;

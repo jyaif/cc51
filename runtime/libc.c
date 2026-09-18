@@ -284,21 +284,43 @@ static int __vprint(void (*out)(char), const char *fmt, va_list ap) {
           zero = 0;
         }
         break;
+      case 'p':
+      case 'P': {
+        /* A generic pointer prints as <space>:0x<address> (SDCC). */
+        unsigned long pv = (unsigned long)va_arg(ap, char *);
+        unsigned char memtype = (unsigned char)(pv >> 16);
+        unsigned char nd = 4;
+        char *q = buf;
+        if (memtype >= 0x80) *q = 'C';
+        else if (memtype >= 0x60) { *q = 'P'; nd = 2; }
+        else if (memtype >= 0x40) { *q = 'I'; nd = 2; }
+        else *q = 'X';
+        q++;
+        *q++ = ':';
+        *q++ = '0';
+        *q++ = 'x';
+        while (nd--) {
+          unsigned char d = (unsigned char)((pv >> (nd * 4)) & 0xf);
+          *q++ = d < 10 ? '0' + d : (c == 'P' ? 'A' : 'a') + d - 10;
+        }
+        s = buf;
+        len = (unsigned char)(q - buf);
+        zero = 0;
+        sign = 0;
+        break;
+      }
       case 'd':
       case 'i':
       case 'u':
       case 'x':
       case 'X':
-      case 'o':
-      case 'p': {
+      case 'o': {
         unsigned long v;
         unsigned char base = 10;
-        if (c == 'x' || c == 'X' || c == 'p') base = 16;
+        if (c == 'x' || c == 'X') base = 16;
         if (c == 'o') base = 8;
         if (c != 'd' && c != 'i') sign = 0;
-        if (c == 'p') {
-          v = (unsigned int)va_arg(ap, char *);
-        } else if (is_long) {
+        if (is_long) {
           v = va_arg(ap, unsigned long);
           if ((c == 'd' || c == 'i') && (long)v < 0) {
             sign = '-';

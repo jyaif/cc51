@@ -206,18 +206,32 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// The address space of the object whose address `e` computes, if it is known.
+fn addr_space(prog: &Program, e: &Expr) -> Option<Space> {
+    fn object_space(prog: &Program, e: &Expr) -> Option<Space> {
+        match &e.kind {
+            ExprKind::Global(g) => Some(match prog.globals[*g].space {
+                Space::Sfr | Space::Sbit | Space::Bit => Space::Data,
+                s => s,
+            }),
+            ExprKind::Member(b, _) => object_space(prog, b),
+            _ => None,
+        }
+    }
+    match &e.kind {
+        ExprKind::AddrOf(i) => object_space(prog, i),
+        ExprKind::Cast(i) => addr_space(prog, i),
+        _ => None,
+    }
+}
+
 /// Address of an lvalue as a constant.
 fn eval_addr(prog: &Program, e: &Expr) -> Option<ConstVal> {
     match &e.kind {
-        ExprKind::Global(g) => {
-            let gl = &prog.globals[*g];
-            if let Some(a) = gl.at {
-                if gl.space != Space::Code {
-                    return Some(ConstVal::Int(a as i64));
-                }
-            }
-            Some(ConstVal::Addr(RelocTarget::Global(*g), 0))
-        }
+        ExprKind::Global(_) => Some(ConstVal::Addr(RelocTarget::Global(*match &e.kind {
+            ExprKind::Global(g) => g,
+            _ => unreachable!(),
+        }), 0)),
         ExprKind::Func(f) => Some(ConstVal::Addr(RelocTarget::Func(*f), 0)),
         ExprKind::Member(b, fi) => {
             let TypeKind::Record(r) = b.ty.kind else { return None };
@@ -249,14 +263,25 @@ pub fn eval_const(prog: &Program, e: &Expr) -> Option<ConstVal> {
                     if e.ty.is_float() {
                         let f = if inner.ty.is_signed() { i as f64 } else { i as u64 as f64 };
                         Some(ConstVal::Float(f))
-                    } else if e.ty.is_pointer() && !e.ty.is_func_ptr() && prog.size(&e.ty) == 3 && i & 0xffff != 0 && (inner.ty.is_integer() || prog.size(&inner.ty) == 2) {
+                    } else if e.ty.is_pointer()
+                        && !e.ty.is_func_ptr()
+                        && prog.size(&e.ty) == 3
+                        && i & 0xffff != 0
+                        && (inner.ty.is_integer() || (inner.ty.is_pointer() && prog.size(&inner.ty) < 3))
+                    {
                         // Non-null constant converted to a generic pointer: add the space tag.
-                        let tag = if inner.ty.is_pointer() {
-                            prog.ptr_space(&inner.ty).map_or(0x40, |s| s.gptr_tag())
+                        let tag = if let Some(sp) = addr_space(prog, inner) {
+                            Some(sp.gptr_tag())
+                        } else if inner.ty.is_pointer() {
+                            Some(prog.ptr_space(&inner.ty).map_or(0x40, |s| s.gptr_tag()))
                         } else {
-                            e.ty.pointee().and_then(|p| p.q.space).map_or(0x40, |s| s.gptr_tag())
+                            // A plain integer keeps whatever it holds in the tag byte (SDCC).
+                            e.ty.pointee().and_then(|p| p.q.space).map(|s| s.gptr_tag())
                         };
-                        Some(ConstVal::Int((i & 0xffff) | ((tag as i64) << 16)))
+                        match tag {
+                            Some(t) => Some(ConstVal::Int((i & 0xffff) | ((t as i64) << 16))),
+                            None => Some(ConstVal::Int(norm_int(i, &e.ty))),
+                        }
                     } else {
                         Some(ConstVal::Int(norm_int(i, &e.ty)))
                     }
@@ -269,10 +294,11 @@ pub fn eval_const(prog: &Program, e: &Expr) -> Option<ConstVal> {
                     }
                 }
                 ConstVal::Addr(t, a) => {
-                    if e.ty.is_pointer() || prog.size(&e.ty) >= 2 {
-                        Some(ConstVal::Addr(t, a))
-                    } else if e.ty.is_bool() {
+                    if e.ty.is_bool() {
                         Some(ConstVal::Int(1))
+                    } else if e.ty.is_pointer() || e.ty.is_integer() {
+                        // A narrower integer keeps the low bytes of the address.
+                        Some(ConstVal::Addr(t, a))
                     } else {
                         None
                     }

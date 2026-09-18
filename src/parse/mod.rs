@@ -96,6 +96,8 @@ pub struct Parser<'a> {
     in_sizeof: usize,
     /// Definitions in this unit yield to existing ones (library code).
     weak: bool,
+    /// Nesting depth of a static initializer being parsed.
+    static_init: u32,
 }
 
 pub fn parse_tu(toks: Vec<Token>, prog: &mut Program) -> Result<()> {
@@ -120,6 +122,7 @@ pub fn parse_tu_ex(toks: Vec<Token>, prog: &mut Program, weak: bool) -> Result<(
         pending_init: None,
         in_sizeof: 0,
         weak,
+        static_init: 0,
     };
     p.builtin_typedefs();
     while !p.at_eof() {
@@ -1395,7 +1398,10 @@ impl<'a> Parser<'a> {
                 }
                 _ => ty,
             };
-            let (items, fty) = self.initializer(&ty)?;
+            self.static_init += 1;
+            let r = self.initializer(&ty);
+            self.static_init -= 1;
+            let (items, fty) = r?;
             let data = self.eval_static_init(&fty, &items, loc)?;
             let g = &mut self.prog.globals[gid];
             if g.init.is_some() {
@@ -1772,7 +1778,10 @@ impl<'a> Parser<'a> {
                 });
                 self.declare(name, Entry::Global(gid));
                 if self.eat_p("=") {
-                    let (items, fty) = self.initializer(&ty)?;
+                    self.static_init += 1;
+                    let r = self.initializer(&ty);
+                    self.static_init -= 1;
+                    let (items, fty) = r?;
                     let data = self.eval_static_init(&fty, &items, loc)?;
                     let g = &mut self.prog.globals[gid];
                     g.ty = fty;

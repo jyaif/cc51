@@ -1151,7 +1151,10 @@ impl<'a> Parser<'a> {
     fn compound_literal(&mut self, ty: Type, loc: Loc) -> Result<Expr> {
         if self.fctx.is_none() || self.in_sizeof > 0 && self.fctx.is_none() {
             // File scope: anonymous global.
-            let (items, fty) = self.initializer(&ty)?;
+            self.static_init += 1;
+            let r = self.initializer(&ty);
+            self.static_init -= 1;
+            let (items, fty) = r?;
             let data = self.eval_static_init(&fty, &items, loc)?;
             let id = self.prog.globals.len();
             let space = if fty.q.is_const { Space::Code } else { Space::Data };
@@ -1360,6 +1363,14 @@ impl<'a> Parser<'a> {
 
     /// Conversion as if by assignment.
     pub(super) fn assign_conv(&mut self, e: Expr, ty: &Type, loc: Loc) -> Result<Expr> {
+        // SDCC initializes a pointer from an object of another type with that object's address.
+        if self.static_init > 0 && ty.is_pointer() && !e.ty.is_pointer() && !e.ty.is_array() && !e.ty.is_func() {
+            if matches!(e.kind, ExprKind::Global(_) | ExprKind::Member(..)) {
+                diag::warn(loc, format!("taking the address of '{}' to initialize '{}'", e.ty, ty));
+                let a = self.addr_of(e, loc)?;
+                return self.assign_conv(a, ty, loc);
+            }
+        }
         let e = self.rval(e);
         if ty.is_record() {
             if !e.ty.same(ty) {
