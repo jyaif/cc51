@@ -380,6 +380,12 @@ fn compile_with(prog: &Program, opts: &Options, upper_objects: bool) -> Result<O
                                 _ => {}
                             }
                         }
+                        // Symbols used by the terminator (comparisons against a function address, say).
+                        b.term.for_each_val(|v| {
+                            if let Val::Addr(s, _) = v {
+                                add_sym(s, &mut work);
+                            }
+                        });
                     }
                 }
             }

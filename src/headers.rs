@@ -12,7 +12,7 @@ macro_rules! headers {
 }
 
 headers!(
-    "8051.h", "8052.h", "reg51.h", "reg52.h", "assert.h", "ctype.h", "errno.h", "float.h", "math.h", "setjmp.h", "iso646.h", "limits.h", "stdalign.h",
+    "8051.h", "8052.h", "reg51.h", "reg52.h", "assert.h", "ctype.h", "errno.h", "float.h", "math.h", "setjmp.h", "stdbit.h", "iso646.h", "limits.h", "stdalign.h",
     "stdarg.h", "stdbool.h", "stddef.h", "stdint.h", "stdlib.h", "stdnoreturn.h", "string.h", "stdio.h",
 );
 

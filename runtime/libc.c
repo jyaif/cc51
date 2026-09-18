@@ -1171,3 +1171,33 @@ long long __modslonglong(long long a, long long b) {
   __udivmod64((unsigned long long)a, (unsigned long long)b, &r);
   return neg ? -(long long)r : (long long)r;
 }
+
+/* ---- stdbit.h helpers ---- */
+
+unsigned char __stdc_ones(unsigned long long v) {
+  unsigned char n = 0;
+  while (v) {
+    n += (unsigned char)(v & 1);
+    v >>= 1;
+  }
+  return n;
+}
+
+unsigned char __stdc_width(unsigned long long v) {
+  unsigned char n = 0;
+  while (v) {
+    n++;
+    v >>= 1;
+  }
+  return n;
+}
+
+unsigned char __stdc_ctz(unsigned long long v, unsigned char bits) {
+  unsigned char n = 0;
+  if (!v) return bits;
+  while (!(v & 1)) {
+    n++;
+    v >>= 1;
+  }
+  return n;
+}
