@@ -12,6 +12,12 @@ enum Storage {
     Frame(u32),
 }
 
+/// One variadic argument, evaluated before any of them is stored.
+enum VarArg {
+    Scalar(Val, Ty),
+    Agg(Mem, u32),
+}
+
 #[derive(Clone, Debug)]
 enum LVal {
     Reg(VReg),
@@ -107,7 +113,14 @@ pub fn varargs_obj_index(prog: &Program, fid: FuncId) -> u32 {
 pub fn build_func(prog: &Program, fid: FuncId) -> Result<Func> {
     let af = &prog.funcs[fid];
     let ft = af.ftype().clone();
-    let ret = if ft.ret.is_void() || ft.ret.is_record() { None } else { Some(ir_ty(prog, &ft.ret)) };
+    // An address-taken function returning an aggregate also hands back the address of its return
+    // object, so that calls through a pointer can find it.
+    let ret_by_addr = ft.ret.is_record() && af.addr_taken;
+    let ret = if ft.ret.is_void() || ft.ret.is_record() {
+        if ret_by_addr { Some(Ty::I8) } else { None }
+    } else {
+        Some(ir_ty(prog, &ft.ret))
+    };
     let f = Func {
         id: fid,
         name: af.name.clone(),
@@ -188,9 +201,11 @@ pub fn build_func(prog: &Program, fid: FuncId) -> Result<Func> {
         for &c in b.crit.clone().iter().rev() {
             b.emit(Inst::CritExit(c));
         }
-        let t = if b.f.ret.is_some() {
+        let t = if let (true, Some(obj)) = (ret_by_addr, b.f.ret_obj) {
+            Term::Ret(Some(Val::Addr(Sym::Frame(fid, obj), 0)))
+        } else if b.f.ret.is_some() {
             // Falling off the end of a non-void function: return an undefined value (0).
-            if &*af.name == "main" { Term::Ret(Some(Val::K(0))) } else { Term::Ret(Some(Val::K(0))) }
+            Term::Ret(Some(Val::K(0)))
         } else {
             Term::Ret(None)
         };
@@ -349,13 +364,23 @@ impl<'a> Builder<'a> {
             }
             ExprKind::Call(..) if e.ty.is_record() => {
                 // Aggregate returned by a call: lives in the callee's return object.
-                self.call(e)?;
+                let v = self.call(e)?;
                 let ExprKind::Call(callee, _) = &e.kind else { unreachable!() };
-                match &callee.kind {
-                    ExprKind::Func(fid) => {
-                        let obj = self.ret_obj_index(*fid);
-                        Ok(LVal::Mem(Mem::Sym(Sym::Frame(*fid, obj), 0), Ty::I8))
+                let direct = match &callee.kind {
+                    ExprKind::Func(fid) => Some(*fid),
+                    ExprKind::AddrOf(inner) => match inner.kind {
+                        ExprKind::Func(fid) => Some(fid),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match (direct, v) {
+                    (Some(fid), _) => {
+                        let obj = self.ret_obj_index(fid);
+                        Ok(LVal::Mem(Mem::Sym(Sym::Frame(fid, obj), 0), Ty::I8))
                     }
+                    // Through a pointer: the callee handed back the address of its return object.
+                    (None, Some(p)) => Ok(LVal::Mem(Mem::Ptr(p, 0, PSpace::S(Space::Data)), Ty::I8)),
                     _ => err(e.loc, "indirect call returning a struct is not supported"),
                 }
             }
@@ -387,6 +412,21 @@ impl<'a> Builder<'a> {
             ExprKind::Comma(a, b) => {
                 self.effect(a)?;
                 self.lvalue(b)
+            }
+            ExprKind::Builtin(Builtin::VaArg, args) if e.ty.is_record() => {
+                // An aggregate argument sits in the argument area; hand back its address.
+                let ap = &args[0];
+                let lv = self.lvalue(ap)?;
+                let p = self.load(&lv);
+                let sp = ptr_pspace(self.prog, &ap.ty);
+                let size = self.prog.size(&e.ty);
+                let pt = self.val_ty(p, Ty::I16);
+                // Keep the old pointer in a temporary: advancing the list may overwrite it.
+                let base = self.tmp(pt);
+                self.emit(Inst::Copy(base, p));
+                let np = self.ptr_offset(Val::R(base), pt, Val::K(size as i64));
+                self.store(&lv, np);
+                Ok(LVal::Mem(Mem::Ptr(Val::R(base), 0, sp), Ty::I8))
             }
             _ => err(e.loc, "expression is not an lvalue"),
         }
@@ -1305,9 +1345,14 @@ impl<'a> Builder<'a> {
         };
         let variadic_extra = args.len() > params.len();
         // Evaluate variable arguments first; they are stored after all arguments are evaluated.
-        let mut var_vals: Vec<(Val, Ty)> = Vec::new();
+        let mut var_vals: Vec<VarArg> = Vec::new();
         if variadic_extra {
             for a in &args[params.len()..] {
+                if a.ty.is_record() {
+                    let m = self.agg_mem(a)?;
+                    var_vals.push(VarArg::Agg(m, self.prog.size(&a.ty)));
+                    continue;
+                }
                 let v = self.rvalue(a)?;
                 if self.prog.is_generic_vararg_ptr(&a.ty) || a.ty.is_array() {
                     // Pass data pointers as generic pointers.
@@ -1318,13 +1363,13 @@ impl<'a> Builder<'a> {
                         let tag = self.prog.ptr_space(&a.ty).map(|s| s.gptr_tag()).unwrap_or(0x40);
                         self.make_gptr(v, tag)
                     };
-                    var_vals.push((gv, Ty::I24));
+                    var_vals.push(VarArg::Scalar(gv, Ty::I24));
                     continue;
                 }
                 let t = if a.ty.is_array() { Ty::I16 } else { self.ty(&a.ty) };
                 let (v, t) = if t == Ty::Bit { (self.resize(v, Ty::Bit, Ty::I8, false), Ty::I8) } else { (v, t) };
                 // Keep constants/addresses as is; registers may be clobbered by later argument calls only if they are memory reads.
-                var_vals.push((v, t));
+                var_vals.push(VarArg::Scalar(v, t));
             }
         }
         let mut vals = Vec::new();
@@ -1348,12 +1393,26 @@ impl<'a> Builder<'a> {
             let Callee::Direct(fid) = target else { return err(e.loc, "variadic calls through function pointers are not supported") };
             let obj = varargs_obj_index(self.prog, fid);
             let mut off = 0i32;
-            for (v, t) in var_vals {
-                self.emit(Inst::Store(Mem::Sym(Sym::Frame(fid, obj), off), v, t));
-                off += t.bytes() as i32;
+            for va in var_vals {
+                match va {
+                    VarArg::Scalar(v, t) => {
+                        self.emit(Inst::Store(Mem::Sym(Sym::Frame(fid, obj), off), v, t));
+                        off += t.bytes() as i32;
+                    }
+                    VarArg::Agg(m, size) => {
+                        self.emit(Inst::MemCopy(Mem::Sym(Sym::Frame(fid, obj), off), m, size));
+                        off += size as i32;
+                    }
+                }
             }
         }
         if ft.ret.is_void() || ft.ret.is_record() {
+            // A call through a pointer picks up the address of the aggregate the callee returns.
+            if ft.ret.is_record() && matches!(target, Callee::Indirect(..)) {
+                let r = self.tmp(Ty::I8);
+                self.emit(Inst::Call(Some(r), target, vals));
+                return Ok(Some(Val::R(r)));
+            }
             self.emit(Inst::Call(None, target, vals));
             if ft.attrs.noreturn {
                 self.terminate(Term::Unreachable);
@@ -1563,7 +1622,8 @@ impl<'a> Builder<'a> {
                         let src = self.agg_mem(e)?;
                         let obj = self.f.ret_obj.unwrap();
                         self.emit(Inst::MemCopy(Mem::Sym(Sym::Frame(self.fid, obj), 0), src, size));
-                        None
+                        // Address-taken functions also return the address of that object.
+                        self.f.ret.map(|_| Val::Addr(Sym::Frame(self.fid, obj), 0))
                     }
                     Some(e) => Some(self.rvalue(e)?),
                     None => None,
