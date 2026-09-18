@@ -1,7 +1,7 @@
 //! Assembly-level peephole optimizations: dead-store elimination on machine resources,
 //! jump threading and tail calls.
 
-use crate::asm::{Expr, Insn, Item, Mn, Op};
+use crate::asm::{insn_size, Expr, Insn, Item, Mn, Op};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -473,13 +473,13 @@ fn jumps(items: &mut Vec<Item>, cx: &PeepCtx) -> bool {
 }
 
 
-/// Pairs of instructions that a shorter one replaces, using liveness to check what may be dropped.
+/// Short sequences that a shorter one replaces, using liveness to check what may be dropped.
 fn combine(items: &mut Vec<Item>, cx: &PeepCtx) -> bool {
     let effs = effects(items, cx);
     let live = liveness(items, cx, &effs);
-    // (index, replacement, whether the following instruction goes away); applied after the scan so
-    // that every decision reads the liveness of the unmodified list.
-    let mut edits: Vec<(usize, Insn, bool)> = Vec::new();
+    // (index, how many items to replace, what to put there); applied after the scan so that every
+    // decision reads the liveness of the unmodified list.
+    let mut edits: Vec<(usize, usize, Vec<Insn>)> = Vec::new();
     let mut i = 0;
     while i + 1 < items.len() {
         let (Item::Insn(a), Item::Insn(b)) = (&items[i], &items[i + 1]) else {
@@ -495,9 +495,21 @@ fn combine(items: &mut Vec<Item>, cx: &PeepCtx) -> bool {
                     _ => None,
                 };
                 if let Some(mn) = mn {
-                    edits.push((i, Insn::new(mn, vec![Op::A]), false));
+                    edits.push((i, 1, vec![Insn::new(mn, vec![Op::A])]));
                     i += 1;
                     continue;
+                }
+            }
+        }
+        // `dec Rn` then a test against zero is `djnz`.
+        if a.mn == Mn::Dec && b.mn == Mn::Cjne && R_C & live[i + 2] == 0 {
+            if let (Some(Op::R(n)), Some(Op::R(m)), Some(Op::Imm(k))) = (a.ops.first(), b.ops.first(), b.ops.get(1)) {
+                if n == m && k.const_val() == Some(0) {
+                    if let Some(t) = b.ops.get(2) {
+                        edits.push((i, 2, vec![Insn::new(Mn::Djnz, vec![Op::R(*n), t.clone()])]));
+                        i += 2;
+                        continue;
+                    }
                 }
             }
         }
@@ -506,7 +518,7 @@ fn combine(items: &mut Vec<Item>, cx: &PeepCtx) -> bool {
             // `mov Rn, <direct>` then `mov a, Rn`, with Rn dead: load A directly.
             if let (Some(Op::R(n)), Some(src @ Op::Dir(_))) = (a.ops.first(), a.ops.get(1)) {
                 if b.ops.first() == Some(&Op::A) && b.ops.get(1) == Some(&Op::R(*n)) && reg_res(*n) & after == 0 {
-                    edits.push((i, Insn::new(Mn::Mov, vec![Op::A, src.clone()]), true));
+                    edits.push((i, 2, vec![Insn::new(Mn::Mov, vec![Op::A, src.clone()])]));
                     i += 2;
                     continue;
                 }
@@ -515,8 +527,39 @@ fn combine(items: &mut Vec<Item>, cx: &PeepCtx) -> bool {
             if let (Some(Op::A), Some(src @ Op::Dir(_))) = (a.ops.first(), a.ops.get(1)) {
                 if let Some(Op::R(n)) = b.ops.first() {
                     if b.ops.get(1) == Some(&Op::A) && R_A & after == 0 {
-                        edits.push((i, Insn::new(Mn::Mov, vec![Op::R(*n), src.clone()]), true));
+                        edits.push((i, 2, vec![Insn::new(Mn::Mov, vec![Op::R(*n), src.clone()])]));
                         i += 2;
+                        continue;
+                    }
+                }
+            }
+            // A run of moves of one constant: load it into A once and store it from there.
+            if R_A & live[i] == 0 {
+                if let Some(imm @ Op::Imm(_)) = a.ops.get(1) {
+                    let mut n = 0;
+                    let mut cost = 0i32;
+                    while let Some(Item::Insn(x)) = items.get(i + n) {
+                        if x.mn != Mn::Mov || x.ops.get(1) != Some(imm) {
+                            break;
+                        }
+                        match x.ops.first() {
+                            Some(Op::R(_)) => cost += 1,
+                            Some(Op::Dir(e)) if dir_res(e, cx.bank) != Some(R_A) => cost += 1,
+                            _ => break,
+                        }
+                        n += 1;
+                    }
+                    let Some(Op::Imm(e)) = a.ops.get(1) else { unreachable!() };
+                    let load = if e.const_val() == Some(0) { Insn::new(Mn::Clr, vec![Op::A]) } else { Insn::new(Mn::Mov, vec![Op::A, imm.clone()]) };
+                    let setup = insn_size(&load, crate::asm::Reach::Short) as i32;
+                    if n >= 2 && cost - setup > 0 {
+                        let mut out = vec![load];
+                        for k in 0..n {
+                            let Item::Insn(x) = &items[i + k] else { unreachable!() };
+                            out.push(Insn::new(Mn::Mov, vec![x.ops[0].clone(), Op::A]));
+                        }
+                        edits.push((i, n, out));
+                        i += n;
                         continue;
                     }
                 }
@@ -525,11 +568,8 @@ fn combine(items: &mut Vec<Item>, cx: &PeepCtx) -> bool {
         i += 1;
     }
     let changed = !edits.is_empty();
-    for (i, ins, drop_next) in edits.into_iter().rev() {
-        items[i] = Item::Insn(ins);
-        if drop_next {
-            items.remove(i + 1);
-        }
+    for (i, n, ins) in edits.into_iter().rev() {
+        items.splice(i..i + n, ins.into_iter().map(Item::Insn));
     }
     changed
 }
