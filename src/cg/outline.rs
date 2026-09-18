@@ -75,6 +75,26 @@ fn hash_seq(items: &[Item], start: usize, len: usize) -> u64 {
     h.finish()
 }
 
+/// A call at the end of an outlined routine is a tail call: jump instead, and drop the return that
+/// can no longer be reached. Later rounds can leave one behind by outlining a routine's own tail.
+fn tail_call(items: &mut Vec<Item>) {
+    let mut i = 0;
+    while i + 1 < items.len() {
+        let (Item::Insn(a), Item::Insn(b)) = (&items[i], &items[i + 1]) else {
+            i += 1;
+            continue;
+        };
+        if matches!(a.mn, Mn::Call | Mn::Acall | Mn::Lcall) && b.mn == Mn::Ret {
+            if let Some(t) = a.target().cloned() {
+                items[i] = Item::Insn(Insn::new(Mn::Jmp, vec![Op::Code(t)]));
+                items.remove(i + 1);
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
 /// Returns the number of outlined routines created.
 pub fn run(sections: &mut Vec<Section>, eligible: &[bool], globals: &HashSet<Rc<str>>) -> usize {
     let mut created = 0;
@@ -205,9 +225,15 @@ pub fn run(sections: &mut Vec<Section>, eligible: &[bool], globals: &HashSet<Rc<
                 sections[si].items.splice(start..start + len, std::iter::once(Item::Insn(repl)));
             }
         }
+        tail_call(&mut body);
         sections.push(Section { name: name.clone(), items: body, org: None, absolute: false });
         eligible.push(true);
         globals.insert(name);
+        for sec in sections.iter_mut() {
+            if sec.name.starts_with("__outl") {
+                tail_call(&mut sec.items);
+            }
+        }
         created += 1;
     }
     created
