@@ -145,10 +145,30 @@ fn splice(src: &str) -> (Vec<char>, Vec<(u32, u32)>) {
 }
 
 fn is_ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_' || c == '$'
+    // Characters outside ASCII are identifier characters (C23 6.4.2), except the private-use
+    // block that holds bytes recovered from a non-UTF-8 source.
+    c.is_ascii_alphabetic() || c == '_' || c == '$' || (c as u32 >= 0x80 && !('\u{E000}'..='\u{E0FF}').contains(&c))
 }
 fn is_ident_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '$'
+    c.is_ascii_digit() || is_ident_start(c)
+}
+
+/// A universal character name (`\uXXXX` / `\UXXXXXXXX`) at `i`, and its length in characters.
+fn ucn_at(s: &[char], i: usize) -> Option<(char, usize)> {
+    if s.get(i) != Some(&'\\') {
+        return None;
+    }
+    let ndigits = match s.get(i + 1) {
+        Some('u') => 4,
+        Some('U') => 8,
+        _ => return None,
+    };
+    let mut v: u32 = 0;
+    for k in 0..ndigits {
+        let d = s.get(i + 2 + k)?.to_digit(16)?;
+        v = v * 16 + d;
+    }
+    Some((char::from_u32(v)?, 2 + ndigits))
 }
 
 pub fn tokenize(src: &str, file: u32) -> Result<Vec<PTok>> {
@@ -270,11 +290,21 @@ pub fn tokenize(src: &str, file: u32) -> Result<Vec<PTok>> {
                 i += 1;
             }
             kind = if q == '"' { PKind::Str } else { PKind::Char };
-        } else if is_ident_start(c) {
-            while i < n && is_ident_char(s[i]) {
+        } else if is_ident_start(c) || ucn_at(&s, i).is_some() {
+            // Identifiers may be spelled with universal character names; keep the character.
+            let mut word = String::new();
+            while i < n {
+                if let Some((u, len)) = ucn_at(&s, i) {
+                    word.push(u);
+                    i += len;
+                    continue;
+                }
+                if !is_ident_char(s[i]) {
+                    break;
+                }
+                word.push(s[i]);
                 i += 1;
             }
-            let word: String = s[start..i].iter().collect();
             if word == "__asm" {
                 toks.push(PTok { kind: PKind::Ident, text: word.into(), loc, space, bol, hideset: None, noexpand: false });
                 // Capture raw assembly text up to __endasm / _endasm.
@@ -315,7 +345,10 @@ pub fn tokenize(src: &str, file: u32) -> Result<Vec<PTok>> {
                 space = true;
                 continue;
             }
-            kind = PKind::Ident;
+            toks.push(PTok { kind: PKind::Ident, text: word.into(), loc, space, bol, hideset: None, noexpand: false });
+            bol = false;
+            space = false;
+            continue;
         } else {
             let mut matched = None;
             for p in PUNCTS {
