@@ -11,7 +11,8 @@ pub enum Tok {
     /// Integer constant: value and C type.
     Int(u64, IntLitTy),
     Float(f64, bool),
-    Str(Vec<u8>),
+    /// String literal: encoded bytes and element width (1, 2 or 4).
+    Str(Vec<u8>, u8),
     Punct(&'static str),
     Asm(String),
     Pragma(String),
@@ -85,8 +86,6 @@ fn canonical_keyword(s: &str) -> Option<Kw> {
         "__signed" | "__signed__" => "signed",
         "__typeof" | "__typeof__" => "typeof",
         "__alignof" | "__alignof__" => "_Alignof",
-        "_asm" => "__asm",
-        "_endasm" => "__endasm",
         "__attribute" => "__attribute__",
         "bool" => "_Bool",
         "static_assert" => "_Static_assert",
@@ -242,10 +241,20 @@ fn parse_escape(chars: &[char], i: &mut usize, loc: Loc) -> Result<u32> {
     })
 }
 
-/// Parse a character literal; returns (value as int, wide).
-pub fn parse_char_literal(s: &str, loc: Loc) -> Result<(i64, bool)> {
-    let wide = !s.starts_with('\'');
+/// Element width in bytes implied by a literal prefix (`u8`, `u`, `U`, `L`).
+fn literal_width(prefix: &str) -> u8 {
+    match prefix {
+        "u" => 2,
+        "U" | "L" => 4,
+        _ => 1,
+    }
+}
+
+/// Parse a character literal; returns (value as int, element width in bytes).
+pub fn parse_char_literal(s: &str, loc: Loc) -> Result<(i64, u8)> {
     let start = s.find('\'').unwrap() + 1;
+    let width = literal_width(&s[..start - 1]);
+    let wide = width > 1;
     let chars: Vec<char> = s[start..s.len() - 1].chars().collect();
     let mut i = 0;
     let mut vals = Vec::new();
@@ -273,47 +282,71 @@ pub fn parse_char_literal(s: &str, loc: Loc) -> Result<(i64, bool)> {
         return err(loc, "empty character constant");
     }
     if wide {
-        return Ok((vals[0] as i64, true));
+        let v = vals[0] as i64;
+        // u'...' holds a single UTF-16 code unit; a character above the BMP doesn't fit.
+        return Ok((if width == 2 { v & 0xffff } else { v }, width));
     }
     if vals.len() == 1 {
         // char is unsigned in this implementation.
-        return Ok(((vals[0] & 0xff) as i64, false));
+        return Ok(((vals[0] & 0xff) as i64, 1));
     }
     let mut v: i64 = 0;
     for x in vals {
         v = (v << 8) | (x & 0xff) as i64;
     }
-    Ok(((v as i16) as i64, false))
+    Ok(((v as i16) as i64, 1))
 }
 
-fn parse_string_literal(s: &str, loc: Loc, out: &mut Vec<u8>) -> Result<()> {
+/// Encode one code point into `out` using the literal's element width.
+fn push_char(out: &mut Vec<u8>, v: u32, width: u8) {
+    match width {
+        2 => {
+            if v >= 0x10000 && v <= 0x10FFFF {
+                let x = v - 0x10000;
+                for u in [0xD800 + (x >> 10), 0xDC00 + (x & 0x3FF)] {
+                    out.extend_from_slice(&(u as u16).to_le_bytes());
+                }
+            } else {
+                out.extend_from_slice(&(v as u16).to_le_bytes());
+            }
+        }
+        4 => out.extend_from_slice(&v.to_le_bytes()),
+        _ => {
+            if v > 0x7f {
+                if let Some(c) = char::from_u32(v) {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    return;
+                }
+            }
+            out.push(v as u8);
+        }
+    }
+}
+
+fn parse_string_literal(s: &str, loc: Loc, out: &mut Vec<u8>, width: u8) -> Result<()> {
     let start = s.find('"').unwrap() + 1;
     let chars: Vec<char> = s[start..s.len() - 1].chars().collect();
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '\\' {
             i += 1;
+            let ucn = matches!(chars.get(i), Some('u') | Some('U'));
             let v = parse_escape(&chars, &mut i, loc)?;
-            if chars[i - 1] == 'u' || (i >= 5 && chars.get(i.wrapping_sub(5)) == Some(&'u')) {
-                // best effort: encode as UTF-8 if > 0xff
-            }
-            if v > 0xff {
-                if let Some(c) = char::from_u32(v) {
-                    let mut buf = [0u8; 4];
-                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-                } else {
-                    out.push(v as u8);
-                }
-            } else {
+            if ucn {
+                push_char(out, v, width);
+            } else if width == 1 {
+                // \x and octal escapes name a byte value directly.
                 out.push(v as u8);
+            } else {
+                push_char(out, v, width);
             }
         } else if ('\u{E080}'..='\u{E0FF}').contains(&chars[i]) {
             // A byte from a non-UTF-8 source.
             out.push(chars[i] as u32 as u8);
             i += 1;
         } else {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(chars[i].encode_utf8(&mut buf).as_bytes());
+            push_char(out, chars[i] as u32, width);
             i += 1;
         }
     }
@@ -357,18 +390,31 @@ pub fn convert(ptoks: Vec<PTok>) -> Result<Vec<Token>> {
                 }
             }
             PKind::Char => {
-                let (v, _) = parse_char_literal(&t.text, t.loc)?;
-                Tok::Int(v as u64, IntLitTy::Char)
+                let (v, w) = parse_char_literal(&t.text, t.loc)?;
+                let lty = match w {
+                    2 => IntLitTy::UInt,
+                    4 => IntLitTy::ULong,
+                    _ => IntLitTy::Char,
+                };
+                Tok::Int(v as u64, lty)
             }
             PKind::Str => {
+                // The width of a concatenation is that of whichever part is wide.
+                let str_width = |t: &PTok| literal_width(&t.text[..t.text.find('"').unwrap_or(0)]);
+                let mut width = str_width(t);
+                let mut j = i;
+                while j + 1 < ptoks.len() && ptoks[j + 1].kind == PKind::Str {
+                    j += 1;
+                    width = width.max(str_width(&ptoks[j]));
+                }
                 let mut bytes = Vec::new();
-                parse_string_literal(&t.text, t.loc, &mut bytes)?;
+                parse_string_literal(&t.text, t.loc, &mut bytes, width)?;
                 // Adjacent string concatenation.
                 while i + 1 < ptoks.len() && ptoks[i + 1].kind == PKind::Str {
                     i += 1;
-                    parse_string_literal(&ptoks[i].text, ptoks[i].loc, &mut bytes)?;
+                    parse_string_literal(&ptoks[i].text, ptoks[i].loc, &mut bytes, width)?;
                 }
-                Tok::Str(bytes)
+                Tok::Str(bytes, width)
             }
             PKind::Punct => {
                 let p = PUNCTS.iter().find(|p| **p == &*t.text).copied().ok_or_else(|| error(t.loc, "bad punctuator"))?;

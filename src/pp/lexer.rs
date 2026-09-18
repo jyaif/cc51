@@ -228,7 +228,7 @@ pub fn tokenize(src: &str, file: u32) -> Result<Vec<PTok>> {
                 i += 1;
             }
             let word: String = s[start..i].iter().collect();
-            if word == "__asm" || word == "_asm" {
+            if word == "__asm" {
                 toks.push(PTok { kind: PKind::Ident, text: word.into(), loc, space, bol, hideset: None, noexpand: false });
                 // Capture raw assembly text up to __endasm / _endasm.
                 let raw_start = i;
@@ -241,7 +241,7 @@ pub fn tokenize(src: &str, file: u32) -> Result<Vec<PTok>> {
                             k += 1;
                         }
                         let w: String = s[j..k].iter().collect();
-                        if w == "__endasm" || w == "_endasm" {
+                        if w == "__endasm" {
                             found = Some(j);
                             break;
                         }

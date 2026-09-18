@@ -364,7 +364,7 @@ pub struct Program {
     pub spaces: SpaceSolver,
     /// External-linkage symbol table: name -> global or function.
     pub externs: HashMap<Rc<str>, Sym>,
-    pub string_pool: HashMap<Vec<u8>, GlobalId>,
+    pub string_pool: HashMap<(Vec<u8>, u8), GlobalId>,
     pub tu_count: usize,
 }
 

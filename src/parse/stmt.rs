@@ -320,7 +320,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 self.expect_p("(")?;
                 let mut text = Vec::new();
-                while let Tok::Str(s) = self.peek().clone() {
+                while let Tok::Str(s, _) = self.peek().clone() {
                     self.pos += 1;
                     text.extend(s);
                 }

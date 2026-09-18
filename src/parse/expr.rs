@@ -877,8 +877,8 @@ impl<'a> Parser<'a> {
                 let _ = is_f;
                 Ok(Expr::new(ExprKind::Float(v), Type::new(TypeKind::Float), loc))
             }
-            Tok::Str(bytes) => {
-                let g = self.string_global(&bytes);
+            Tok::Str(bytes, width) => {
+                let g = self.string_global(&bytes, width);
                 let ty = self.prog.globals[g].ty.clone();
                 Ok(Expr::new(ExprKind::Global(g), ty, loc))
             }
@@ -900,7 +900,7 @@ impl<'a> Parser<'a> {
             Tok::Ident(name) => {
                 if &*name == "__func__" || &*name == "__FUNCTION__" {
                     let fname = self.fctx.as_ref().map(|c| self.prog.funcs[c.id].name.to_string()).unwrap_or_default();
-                    let g = self.string_global(fname.as_bytes());
+                    let g = self.string_global(fname.as_bytes(), 1);
                     let ty = self.prog.globals[g].ty.clone();
                     return Ok(Expr::new(ExprKind::Global(g), ty, loc));
                 }

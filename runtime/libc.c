@@ -1201,3 +1201,341 @@ unsigned char __stdc_ctz(unsigned long long v, unsigned char bits) {
   }
   return n;
 }
+
+/* ---- integer division results ---- */
+
+typedef struct { int quot, rem; } div_t;
+typedef struct { long quot, rem; } ldiv_t;
+typedef struct { long long quot, rem; } lldiv_t;
+
+div_t div(int num, int den) {
+  div_t r;
+  r.quot = num / den;
+  r.rem = num % den;
+  return r;
+}
+
+ldiv_t ldiv(long num, long den) {
+  ldiv_t r;
+  r.quot = num / den;
+  r.rem = num % den;
+  return r;
+}
+
+lldiv_t lldiv(long long num, long long den) {
+  lldiv_t r;
+  r.quot = num / den;
+  r.rem = num % den;
+  return r;
+}
+
+long long llabs(long long j) { return j < 0 ? -j : j; }
+
+/* ---- multibyte and wide characters (UTF-8 <-> UTF-32/UTF-16) ---- */
+
+#include <errno.h>
+#include <wchar.h>
+#include <uchar.h>
+
+#define __MBERR ((size_t)-1)
+#define __MBINC ((size_t)-2)
+#define __MBSURR ((size_t)-3)
+
+static mbstate_t __mbs_in, __mbs_len, __mbs_c16i, __mbs_c16o;
+
+int mbsinit(const mbstate_t *ps) { return !ps || !ps->c[0]; }
+
+/* Encode one code point as UTF-8; s must have room for 4 bytes. Returns the length, or -1. */
+static int __utf8_enc(char *s, unsigned long wc) {
+  if (wc < 0x80) {
+    s[0] = (char)wc;
+    return 1;
+  }
+  if (wc < 0x800) {
+    s[0] = (char)(0xc0 | (wc >> 6));
+    s[1] = (char)(0x80 | (wc & 0x3f));
+    return 2;
+  }
+  if (wc >= 0xd800 && wc <= 0xdfff) return -1;
+  if (wc < 0x10000) {
+    s[0] = (char)(0xe0 | (wc >> 12));
+    s[1] = (char)(0x80 | ((wc >> 6) & 0x3f));
+    s[2] = (char)(0x80 | (wc & 0x3f));
+    return 3;
+  }
+  if (wc > 0x10ffff) return -1;
+  s[0] = (char)(0xf0 | (wc >> 18));
+  s[1] = (char)(0x80 | ((wc >> 12) & 0x3f));
+  s[2] = (char)(0x80 | ((wc >> 6) & 0x3f));
+  s[3] = (char)(0x80 | (wc & 0x3f));
+  return 4;
+}
+
+size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps) {
+  unsigned char need, seen;
+  unsigned long v;
+  size_t used = 0;
+  if (!ps) ps = &__mbs_in;
+  if (!s) {
+    ps->c[0] = 0;
+    return 0;
+  }
+  need = ps->c[0] >> 4;
+  seen = ps->c[0] & 0x0f;
+  v = ((unsigned long)ps->c[1] << 8) | ps->c[2];
+  while (n) {
+    unsigned char c = (unsigned char)*s++;
+    n--;
+    used++;
+    if (!seen) {
+      if (c < 0x80) {
+        need = 1;
+        v = c;
+      } else if ((c & 0xe0) == 0xc0) {
+        need = 2;
+        v = c & 0x1f;
+      } else if ((c & 0xf0) == 0xe0) {
+        need = 3;
+        v = c & 0x0f;
+      } else if ((c & 0xf8) == 0xf0) {
+        need = 4;
+        v = c & 0x07;
+      } else {
+        errno = EILSEQ;
+        return __MBERR;
+      }
+      seen = 1;
+    } else {
+      if ((c & 0xc0) != 0x80) {
+        errno = EILSEQ;
+        return __MBERR;
+      }
+      v = (v << 6) | (c & 0x3f);
+      seen++;
+    }
+    if (seen == need) {
+      ps->c[0] = 0;
+      if ((v >= 0xd800 && v <= 0xdfff) || v > 0x10ffff) {
+        errno = EILSEQ;
+        return __MBERR;
+      }
+      if (pwc) *pwc = v;
+      return v ? used : 0;
+    }
+  }
+  ps->c[0] = (unsigned char)((need << 4) | seen);
+  ps->c[1] = (unsigned char)(v >> 8);
+  ps->c[2] = (unsigned char)v;
+  return __MBINC;
+}
+
+size_t mbrlen(const char *s, size_t n, mbstate_t *ps) { return mbrtowc(0, s, n, ps ? ps : &__mbs_len); }
+
+size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps) {
+  char buf[4];
+  int r;
+  (void)ps;
+  if (!s) {
+    s = buf;
+    wc = 0;
+  }
+  r = __utf8_enc(s, wc);
+  if (r < 0) {
+    errno = EILSEQ;
+    return __MBERR;
+  }
+  return (size_t)r;
+}
+
+int mbtowc(wchar_t *pwc, const char *s, size_t n) {
+  mbstate_t st;
+  size_t r;
+  if (!s) return 0;
+  st.c[0] = 0;
+  r = mbrtowc(pwc, s, n, &st);
+  if (r == __MBERR || r == __MBINC) return -1;
+  return (int)r;
+}
+
+int mblen(const char *s, size_t n) {
+  mbstate_t st;
+  size_t r;
+  if (!s) return 0;
+  st.c[0] = 0;
+  r = mbrtowc(0, s, n, &st);
+  if (r == __MBERR || r == __MBINC) return -1;
+  return (int)r;
+}
+
+int wctomb(char *s, wchar_t wc) {
+  if (!s) return 0;
+  return __utf8_enc(s, wc);
+}
+
+size_t mbstowcs(wchar_t *pwcs, const char *s, size_t n) {
+  mbstate_t st;
+  size_t cnt = 0;
+  st.c[0] = 0;
+  while (cnt < n) {
+    wchar_t w;
+    size_t r = mbrtowc(&w, s, 4, &st);
+    if (r == __MBERR || r == __MBINC) return __MBERR;
+    if (pwcs) pwcs[cnt] = w;
+    if (!w) return cnt;
+    s += r;
+    cnt++;
+  }
+  return cnt;
+}
+
+size_t wcstombs(char *s, const wchar_t *pwcs, size_t n) {
+  size_t cnt = 0;
+  char buf[4];
+  while (cnt < n) {
+    int r = __utf8_enc(buf, *pwcs);
+    size_t i;
+    if (r < 0) {
+      errno = EILSEQ;
+      return __MBERR;
+    }
+    if (!*pwcs) {
+      if (s) s[cnt] = 0;
+      return cnt;
+    }
+    if (cnt + (size_t)r > n) return cnt;
+    if (s)
+      for (i = 0; i < (size_t)r; i++) s[cnt + i] = buf[i];
+    cnt += r;
+    pwcs++;
+  }
+  return cnt;
+}
+
+wint_t btowc(int c) {
+  if (c == -1 || (unsigned char)c >= 0x80) return WEOF;
+  return (wint_t)(unsigned char)c;
+}
+
+int wctob(wint_t c) { return c <= 0x7f ? (int)c : -1; }
+
+size_t wcslen(const wchar_t *s) {
+  size_t n = 0;
+  while (s[n]) n++;
+  return n;
+}
+
+size_t wcsnlen(const wchar_t *s, size_t n) {
+  size_t i = 0;
+  while (i < n && s[i]) i++;
+  return i;
+}
+
+int wcscmp(const wchar_t *s1, const wchar_t *s2) {
+  while (*s1 && *s1 == *s2) {
+    s1++;
+    s2++;
+  }
+  return *s1 == *s2 ? 0 : (*s1 < *s2 ? -1 : 1);
+}
+
+int wcsncmp(const wchar_t *s1, const wchar_t *s2, size_t n) {
+  while (n && *s1 && *s1 == *s2) {
+    s1++;
+    s2++;
+    n--;
+  }
+  if (!n) return 0;
+  return *s1 == *s2 ? 0 : (*s1 < *s2 ? -1 : 1);
+}
+
+size_t mbrtoc32(char32_t *pc32, const char *s, size_t n, mbstate_t *ps) { return mbrtowc((wchar_t *)pc32, s, n, ps); }
+
+size_t c32rtomb(char *s, char32_t c32, mbstate_t *ps) { return wcrtomb(s, c32, ps); }
+
+size_t mbrtoc16(char16_t *pc16, const char *s, size_t n, mbstate_t *ps) {
+  wchar_t w;
+  size_t r;
+  if (!ps) ps = &__mbs_c16i;
+  if (ps->c[0] == 0xff) {
+    /* The low surrogate of the pair decoded by the previous call. */
+    ps->c[0] = 0;
+    if (pc16) *pc16 = ((char16_t)ps->c[1] << 8) | ps->c[2];
+    return __MBSURR;
+  }
+  r = mbrtowc(&w, s, n, ps);
+  if (r == __MBERR || r == __MBINC) return r;
+  if (w >= 0x10000) {
+    unsigned long x = w - 0x10000;
+    unsigned int lo = 0xdc00 + (unsigned int)(x & 0x3ff);
+    ps->c[0] = 0xff;
+    ps->c[1] = (unsigned char)(lo >> 8);
+    ps->c[2] = (unsigned char)lo;
+    if (pc16) *pc16 = (char16_t)(0xd800 + (unsigned int)(x >> 10));
+  } else if (pc16)
+    *pc16 = (char16_t)w;
+  return r;
+}
+
+size_t c16rtomb(char *s, char16_t c16, mbstate_t *ps) {
+  if (!ps) ps = &__mbs_c16o;
+  if (ps->c[0] == 0xff) {
+    unsigned int hi = ((unsigned int)ps->c[1] << 8) | ps->c[2];
+    ps->c[0] = 0;
+    if (c16 >= 0xdc00 && c16 <= 0xdfff)
+      return wcrtomb(s, 0x10000UL + ((unsigned long)(hi - 0xd800) << 10) + (c16 - 0xdc00), 0);
+    errno = EILSEQ;
+    return __MBERR;
+  }
+  if (c16 >= 0xd800 && c16 <= 0xdbff) {
+    ps->c[0] = 0xff;
+    ps->c[1] = (unsigned char)(c16 >> 8);
+    ps->c[2] = (unsigned char)c16;
+    return 0;
+  }
+  if (c16 >= 0xdc00 && c16 <= 0xdfff) {
+    errno = EILSEQ;
+    return __MBERR;
+  }
+  return wcrtomb(s, c16, 0);
+}
+
+size_t __mbstoc16s(char16_t *c16s, const char *s, size_t n) {
+  mbstate_t st;
+  size_t cnt = 0;
+  st.c[0] = 0;
+  while (cnt < n) {
+    char16_t c;
+    size_t r = mbrtoc16(&c, s, 4, &st);
+    if (r == __MBERR || r == __MBINC) return __MBERR;
+    c16s[cnt] = c;
+    if (r == __MBSURR) {
+      cnt++;
+      continue;
+    }
+    if (!c) return cnt;
+    s += r;
+    cnt++;
+  }
+  return cnt;
+}
+
+size_t __c16stombs(char *s, const char16_t *c16s, size_t n) {
+  mbstate_t st;
+  size_t cnt = 0;
+  char buf[4];
+  st.c[0] = 0;
+  while (cnt < n) {
+    size_t i, r = c16rtomb(buf, *c16s, &st);
+    if (r == __MBERR) return __MBERR;
+    if (!*c16s) {
+      s[cnt] = 0;
+      return cnt;
+    }
+    c16s++;
+    if (!r) continue;
+    if (cnt + r > n) return cnt;
+    for (i = 0; i < r; i++) s[cnt + i] = buf[i];
+    cnt += r;
+  }
+  return cnt;
+}

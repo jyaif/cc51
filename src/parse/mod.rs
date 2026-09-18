@@ -192,7 +192,7 @@ impl<'a> Parser<'a> {
             Tok::Kw(k) => format!("'{}'", k.as_str()),
             Tok::Int(v, _) => format!("'{}'", v),
             Tok::Float(v, _) => format!("'{}'", v),
-            Tok::Str(_) => "string literal".into(),
+            Tok::Str(..) => "string literal".into(),
             Tok::Punct(p) => format!("'{}'", p),
             Tok::Asm(_) => "assembly block".into(),
             Tok::Pragma(p) => format!("'#pragma {}'", p),
@@ -462,7 +462,7 @@ impl<'a> Parser<'a> {
         let v = self.const_int_expr()?;
         let mut msg = String::new();
         if self.eat_p(",") {
-            if let Tok::Str(s) = self.next().tok {
+            if let Tok::Str(s, _) = self.next().tok {
                 msg = String::from_utf8_lossy(&s).into_owned();
             }
         }
@@ -1774,17 +1774,21 @@ impl<'a> Parser<'a> {
     }
 
     /// Create (or reuse) an anonymous global for a string literal.
-    fn string_global(&mut self, bytes: &[u8]) -> GlobalId {
+    fn string_global(&mut self, bytes: &[u8], width: u8) -> GlobalId {
         let mut data = bytes.to_vec();
-        data.push(0);
-        if let Some(g) = self.prog.string_pool.get(&data) {
+        data.extend(std::iter::repeat(0).take(width as usize));
+        if let Some(g) = self.prog.string_pool.get(&(data.clone(), width)) {
             return *g;
         }
         let id = self.prog.globals.len();
-        let mut elem = Type::char();
+        let mut elem = match width {
+            2 => Type::uint(),
+            4 => Type::ulong(),
+            _ => Type::char(),
+        };
         elem.q.is_const = true;
         elem.q.space = Some(Space::Code);
-        let ty = Type::new(TypeKind::Array(Rc::new(elem), Some(data.len() as u32)));
+        let ty = Type::new(TypeKind::Array(Rc::new(elem), Some(data.len() as u32 / width as u32)));
         self.prog.globals.push(Global {
             name: format!("__str_{}", id).into(),
             ty,
@@ -1801,7 +1805,7 @@ impl<'a> Parser<'a> {
             volatile: false,
             tu: self.tu,
         });
-        self.prog.string_pool.insert(data, id);
+        self.prog.string_pool.insert((data, width), id);
         id
     }
 }

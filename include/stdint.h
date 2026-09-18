@@ -77,4 +77,9 @@ typedef uint64_t uintmax_t;
 #define UINT64_C(c) c ## ULL
 #define INTMAX_C(c) c ## LL
 #define UINTMAX_C(c) c ## ULL
+#define WCHAR_MIN      0
+#define WCHAR_MAX      0xffffffffUL
+#define WINT_MIN       0
+#define WINT_MAX       0xffffffffUL
+
 #endif

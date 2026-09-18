@@ -17,6 +17,16 @@ fn is_char_type(t: &Type) -> bool {
     matches!(t.kind, TypeKind::Int(IntKind::Char, _))
 }
 
+/// The string literal element width an array of `t` can be initialized from, if any.
+fn str_elem_width(t: &Type) -> Option<u8> {
+    match t.kind {
+        TypeKind::Int(IntKind::Char, _) => Some(1),
+        TypeKind::Int(IntKind::Int, _) | TypeKind::Int(IntKind::Short, _) => Some(2),
+        TypeKind::Int(IntKind::Long, _) => Some(4),
+        _ => None,
+    }
+}
+
 impl<'a> Parser<'a> {
     pub(super) fn initializer(&mut self, ty: &Type) -> Result<(Vec<InitItem>, Type)> {
         let mut items = Vec::new();
@@ -38,26 +48,28 @@ impl<'a> Parser<'a> {
             TypeKind::Array(elem, n) => {
                 let elem = (**elem).clone();
                 let n = *n;
-                if self.pending_init.is_none() && is_char_type(&elem) {
+                if self.pending_init.is_none() && str_elem_width(&elem).is_some() {
+                    let ew = str_elem_width(&elem).unwrap();
                     // String literal initializer, optionally in braces.
-                    let braced_str = self.is_p("{") && matches!(self.peek_at(1), Tok::Str(_)) && matches!(self.peek_at(2), Tok::Punct("}") | Tok::Punct(","));
+                    let is_str = |t: &Tok| matches!(t, Tok::Str(_, w) if *w == ew);
+                    let braced_str = self.is_p("{") && is_str(self.peek_at(1)) && matches!(self.peek_at(2), Tok::Punct("}") | Tok::Punct(","));
                     if braced_str {
                         self.pos += 1;
                     }
-                    if let Tok::Str(s) = self.peek().clone() {
+                    if let Some(Tok::Str(s, _)) = Some(self.peek().clone()).filter(|t| is_str(t)) {
                         self.pos += 1;
                         if braced_str {
                             self.eat_p(",");
                             self.expect_p("}")?;
                         }
                         let mut bytes = s.clone();
-                        bytes.push(0);
+                        bytes.extend(std::iter::repeat(0).take(ew as usize));
                         let len = match n {
                             Some(n) => {
-                                bytes.truncate(n as usize);
+                                bytes.truncate(n as usize * ew as usize);
                                 n
                             }
-                            None => bytes.len() as u32,
+                            None => bytes.len() as u32 / ew as u32,
                         };
                         items.push(InitItem { offset: off, bits: None, kind: InitKind::Bytes(bytes) });
                         return Ok(len);
