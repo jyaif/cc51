@@ -447,6 +447,7 @@ impl<'a> Parser<'a> {
             labels: vec![],
             loc,
             is_inline: false,
+            inline_body: false,
             has_external_def: true,
             addr_taken: true,
             nooverlay: false,
@@ -1479,6 +1480,33 @@ impl<'a> Parser<'a> {
         Ok(id)
     }
 
+    /// Add a fresh function entry for a name that already has a definition (an inline definition
+    /// alongside an external one).
+    fn add_func_entry(&mut self, name: Rc<str>, ty: Type, loc: Loc, spec: &DeclSpec, external: bool) -> FuncId {
+        let id = self.prog.funcs.len();
+        self.prog.funcs.push(Function {
+            name: name.clone(),
+            ty,
+            linkage: if external { Linkage::External } else { Linkage::Internal },
+            body: None,
+            locals: vec![],
+            params: vec![],
+            labels: vec![],
+            loc,
+            is_inline: spec.inline,
+            inline_body: false,
+            has_external_def: external,
+            addr_taken: false,
+            nooverlay: self.nooverlay,
+            tu: self.tu,
+        });
+        if external {
+            self.prog.externs.insert(name.clone(), Sym::Func(id));
+        }
+        self.scopes[0].names.insert(name, Entry::Func(id));
+        id
+    }
+
     fn declare_func(&mut self, name: Rc<str>, ty: Type, spec: &DeclSpec, loc: Loc, is_def: bool) -> Result<FuncId> {
         let static_ = spec.storage == Storage::Static;
         let existing = match self.lookup(&name) {
@@ -1543,6 +1571,7 @@ impl<'a> Parser<'a> {
             labels: vec![],
             loc,
             is_inline: spec.inline,
+            inline_body: false,
             has_external_def: !spec.inline || spec.storage == Storage::Extern,
             addr_taken: false,
             nooverlay: self.nooverlay,
@@ -1595,17 +1624,27 @@ impl<'a> Parser<'a> {
             let nft = FuncType { ret: ft.ret.clone(), params: vec![], variadic: false, unprototyped: true, attrs: ft.attrs.clone() };
             ty = Type::new(TypeKind::Func(Rc::new(nft)));
         }
-        let fid = self.declare_func(name.clone(), ty, spec, loc, true)?;
+        let mut fid = self.declare_func(name.clone(), ty.clone(), spec, loc, true)?;
+        // An inline definition provides no external symbol (C99 6.7.4): it serves its own
+        // translation unit, and an external definition elsewhere is a separate function.
+        let inline_def = spec.inline && spec.storage == Storage::None && !self.weak;
         if self.prog.funcs[fid].body.is_some() {
-            if self.weak || spec.inline || self.prog.funcs[fid].is_inline {
+            let other_inline = self.prog.funcs[fid].inline_body;
+            if other_inline && !inline_def && !self.weak {
+                self.prog.funcs[fid].linkage = Linkage::Internal;
+                self.prog.funcs[fid].inline_body = false;
+                fid = self.add_func_entry(name.clone(), ty, loc, spec, true);
+            } else if inline_def && !other_inline {
+                fid = self.add_func_entry(name.clone(), ty, loc, spec, false);
+            } else if self.weak || spec.inline || self.prog.funcs[fid].is_inline {
                 // Duplicate inline definition from another TU: parse and discard.
-                let saved = self.prog.funcs.len();
-                let _ = saved;
                 self.skip_braces()?;
                 return Ok(());
+            } else {
+                return err(loc, format!("redefinition of '{}'", name));
             }
-            return err(loc, format!("redefinition of '{}'", name));
         }
+        self.prog.funcs[fid].inline_body = inline_def;
         let ret_ty = self.prog.funcs[fid].ftype().ret.clone();
         self.fctx = Some(FuncCtx {
             id: fid,

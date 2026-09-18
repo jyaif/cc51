@@ -53,7 +53,9 @@ def run(path):
     d = os.path.join(OUT, 'build'); os.makedirs(d, exist_ok=True)
     ihx = os.path.join(d, name + '.ihx')
     cmd = [CC, '-I', os.path.join(REG, 'fwk/include'), '-I', os.path.join(REG, 'tests'), '-I', os.path.join(HERE, 'include'),
-           path, os.path.join(REG, 'fwk/lib/testfwk.c'), os.path.join(HERE, 'support.c'), '-o', ihx,
+           path, os.path.join(REG, 'fwk/lib/testfwk.c'), os.path.join(REG, 'fwk/lib/statics.c'),
+           os.path.join(REG, 'fwk/lib/extern1.c'), os.path.join(REG, 'fwk/lib/extern2.c'),
+           os.path.join(HERE, 'support.c'), '-o', ihx,
            '--lst', os.path.join(d, name + '.lst')]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)

@@ -43,14 +43,61 @@ impl PTok {
 }
 
 const PUNCTS: &[&str] = &[
-    "<<=", ">>=", "...", "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "*=", "/=", "%=", "+=",
+    "<<=", ">>=", "...", "%:%:", "<%", "%>", "<:", ":>", "%:", "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "*=", "/=", "%=", "+=",
     "-=", "&=", "^=", "|=", "##", "[", "]", "(", ")", "{", "}", ".", "&", "*", "+", "-", "~", "!", "/", "%", "<",
     ">", "^", "|", "?", ":", ";", "=", ",", "#",
 ];
 
+/// The primary spelling of a digraph, if `s` is one.
+fn digraph(s: &str) -> Option<&'static str> {
+    Some(match s {
+        "<%" => "{",
+        "%>" => "}",
+        "<:" => "[",
+        ":>" => "]",
+        "%:" => "#",
+        "%:%:" => "##",
+        _ => return None,
+    })
+}
+
+/// The character a trigraph `??x` stands for.
+fn trigraph(c: char) -> Option<char> {
+    Some(match c {
+        '=' => '#',
+        '(' => '[',
+        '/' => '\\',
+        ')' => ']',
+        '\'' => '^',
+        '<' => '{',
+        '!' => '|',
+        '>' => '}',
+        '-' => '~',
+        _ => return None,
+    })
+}
+
 /// Remove backslash-newline sequences, keeping track of the original line of each char.
 fn splice(src: &str) -> (Vec<char>, Vec<(u32, u32)>) {
-    let chars: Vec<char> = src.chars().collect();
+    let mut chars: Vec<char> = src.chars().collect();
+    // Translation phase 1: trigraph sequences.
+    if src.contains("??") {
+        let mut out = Vec::with_capacity(chars.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '?' && i + 2 < chars.len() && chars[i + 1] == '?' {
+                if let Some(c) = trigraph(chars[i + 2]) {
+                    out.push(c);
+                    // Keep the column count of the line stable by padding the replacement.
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        chars = out;
+    }
     let mut out = Vec::with_capacity(chars.len());
     let mut pos = Vec::with_capacity(chars.len());
     let (mut line, mut col) = (1u32, 1u32);
@@ -281,6 +328,14 @@ pub fn tokenize(src: &str, file: u32) -> Result<Vec<PTok>> {
             if let Some(l) = matched {
                 i += l;
                 kind = PKind::Punct;
+                // Digraphs stand for their primary spelling.
+                let text: String = s[start..i].iter().collect();
+                if let Some(prim) = digraph(&text) {
+                    toks.push(PTok { kind, text: prim.into(), loc, space, bol, hideset: None, noexpand: false });
+                    bol = false;
+                    space = false;
+                    continue;
+                }
             } else {
                 i += 1;
                 kind = PKind::Other;

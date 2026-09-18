@@ -221,6 +221,8 @@ pub struct Function {
     pub labels: Vec<Rc<str>>,
     pub loc: Loc,
     pub is_inline: bool,
+    /// The body came from an inline definition only (C99 6.7.4: it provides no external symbol).
+    pub inline_body: bool,
     /// A non-inline (external) definition exists.
     pub has_external_def: bool,
     pub addr_taken: bool,

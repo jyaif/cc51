@@ -119,6 +119,7 @@ impl Preprocessor {
             ("__SDCC_VERSION_MAJOR", "4"),
             ("__SDCC_VERSION_MINOR", "6"),
             ("__SDCC_VERSION_PATCH", "0"),
+            ("__SDCC_REVISION", "16555"),
             ("__SDCC_mcs51", "1"),
             ("SDCC_mcs51", "1"),
             ("__mcs51", "1"),
