@@ -175,10 +175,10 @@ pub fn allocate(cx: &AllocCtx) -> Alloc {
                     }
                     // Multi-byte operations read operand bytes after writing result bytes: the result may only
                     // share a location with a (dying) operand at the same byte position.
-                    if f.ty(d).bytes() > 1 && !matches!(ins, Inst::Copy(..) | Inst::Load(..) | Inst::Call(..)) {
+                    if f.ty(d).bytes() > 1 && !matches!(ins, Inst::Load(..) | Inst::Call(..)) {
                         for u in ins.uses() {
                             if u != d && !folded(u) {
-                                let pos_ok = matches!(ins, Inst::Bin(..) | Inst::Un(..)) && f.ty(u) == f.ty(d);
+                                let pos_ok = matches!(ins, Inst::Bin(..) | Inst::Un(..) | Inst::Copy(..)) && f.ty(u) == f.ty(d);
                                 if pos_ok {
                                     aligned.push((d as usize, u as usize));
                                 } else {

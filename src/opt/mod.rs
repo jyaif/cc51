@@ -8,6 +8,7 @@ pub mod dce;
 pub mod inline;
 pub mod loops;
 pub mod narrow;
+pub mod sink;
 
 use crate::ir::{Callee, Func, Ty};
 
@@ -49,6 +50,8 @@ pub fn optimize_func(f: &mut Func, cx: &OptCtx) {
             verify(f, "loops");
             changed |= loops::reduce(f);
             verify(f, "loop strength reduction");
+            changed |= sink::run(f);
+            verify(f, "sink");
         }
         if !changed {
             break;
