@@ -221,7 +221,8 @@ fn target_label(i: &Insn) -> Option<Rc<str>> {
 }
 
 /// Dead store elimination. Returns true if anything changed.
-fn dse(items: &mut Vec<Item>, cx: &PeepCtx) -> bool {
+/// Live machine resources before each item (`live[n]` is the end of the block list).
+fn liveness(items: &[Item], cx: &PeepCtx, effs: &[Option<Eff>]) -> Vec<Res> {
     let n = items.len();
     let mut labels: HashMap<Rc<str>, usize> = HashMap::new();
     for (i, it) in items.iter().enumerate() {
@@ -229,13 +230,6 @@ fn dse(items: &mut Vec<Item>, cx: &PeepCtx) -> bool {
             labels.insert(l.clone(), i);
         }
     }
-    let effs: Vec<Option<Eff>> = items
-        .iter()
-        .map(|it| match it {
-            Item::Insn(i) => Some(effect(i, cx)),
-            _ => None,
-        })
-        .collect();
     let mut live_in = vec![0 as Res; n + 1];
     // live at end: unknown fall-off (shouldn't happen) -> all.
     live_in[n] = R_ALL;
@@ -274,6 +268,23 @@ fn dse(items: &mut Vec<Item>, cx: &PeepCtx) -> bool {
             }
         }
     }
+    live_in
+}
+
+fn effects(items: &[Item], cx: &PeepCtx) -> Vec<Option<Eff>> {
+    items
+        .iter()
+        .map(|it| match it {
+            Item::Insn(i) => Some(effect(i, cx)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn dse(items: &mut Vec<Item>, cx: &PeepCtx) -> bool {
+    let n = items.len();
+    let effs = effects(items, cx);
+    let live_in = liveness(items, cx, &effs);
     // Delete dead pure instructions.
     let mut removed = false;
     let mut keep = vec![true; n];
@@ -461,11 +472,74 @@ fn jumps(items: &mut Vec<Item>, cx: &PeepCtx) -> bool {
     changed
 }
 
+
+/// Pairs of instructions that a shorter one replaces, using liveness to check what may be dropped.
+fn combine(items: &mut Vec<Item>, cx: &PeepCtx) -> bool {
+    let effs = effects(items, cx);
+    let live = liveness(items, cx, &effs);
+    // (index, replacement, whether the following instruction goes away); applied after the scan so
+    // that every decision reads the liveness of the unmodified list.
+    let mut edits: Vec<(usize, Insn, bool)> = Vec::new();
+    let mut i = 0;
+    while i + 1 < items.len() {
+        let (Item::Insn(a), Item::Insn(b)) = (&items[i], &items[i + 1]) else {
+            i += 1;
+            continue;
+        };
+        // `add a, #1` is `inc a` where the flags it sets are dead.
+        if a.mn == Mn::Add && a.ops.first() == Some(&Op::A) && (R_C | R_OV) & live[i + 1] == 0 {
+            if let Some(Op::Imm(e)) = a.ops.get(1) {
+                let mn = match e.const_val() {
+                    Some(1) => Some(Mn::Inc),
+                    Some(0xff) => Some(Mn::Dec),
+                    _ => None,
+                };
+                if let Some(mn) = mn {
+                    edits.push((i, Insn::new(mn, vec![Op::A]), false));
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        if a.mn == Mn::Mov && b.mn == Mn::Mov {
+            let after = live[i + 2];
+            // `mov Rn, <direct>` then `mov a, Rn`, with Rn dead: load A directly.
+            if let (Some(Op::R(n)), Some(src @ Op::Dir(_))) = (a.ops.first(), a.ops.get(1)) {
+                if b.ops.first() == Some(&Op::A) && b.ops.get(1) == Some(&Op::R(*n)) && reg_res(*n) & after == 0 {
+                    edits.push((i, Insn::new(Mn::Mov, vec![Op::A, src.clone()]), true));
+                    i += 2;
+                    continue;
+                }
+            }
+            // `mov a, <direct>` then `mov Rn, a`, with A dead: move it in one step.
+            if let (Some(Op::A), Some(src @ Op::Dir(_))) = (a.ops.first(), a.ops.get(1)) {
+                if let Some(Op::R(n)) = b.ops.first() {
+                    if b.ops.get(1) == Some(&Op::A) && R_A & after == 0 {
+                        edits.push((i, Insn::new(Mn::Mov, vec![Op::R(*n), src.clone()]), true));
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    let changed = !edits.is_empty();
+    for (i, ins, drop_next) in edits.into_iter().rev() {
+        items[i] = Item::Insn(ins);
+        if drop_next {
+            items.remove(i + 1);
+        }
+    }
+    changed
+}
+
 pub fn optimize(items: &mut Vec<Item>, cx: &PeepCtx, has_asm: bool) {
     for _ in 0..10 {
         let mut changed = jumps(items, cx);
         if !has_asm {
             changed |= dse(items, cx);
+            changed |= combine(items, cx);
         }
         if !changed {
             break;

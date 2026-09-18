@@ -557,6 +557,15 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// Source operand for `mov <direct>, <src>`: a register keeps its register form, which is a
+    /// byte shorter than addressing it directly.
+    fn mov_src_op(&self, l: Loc) -> Op {
+        match l {
+            Loc::R(_) => loc_op(l),
+            other => loc_dir(other, self.bank),
+        }
+    }
+
     /// Operand usable where a direct address is required (registers via their direct address).
     fn src_dir_op(&self, s: &Src) -> Option<Op> {
         match s {
@@ -1053,11 +1062,7 @@ impl<'a> Gen<'a> {
             self.e2(Mn::Mov, Op::dir(B_DIR), Op::A);
             return;
         }
-        let sop = match (&op, s) {
-            (Op::R(_), Src::L(l)) => loc_dir(*l, self.bank),
-            _ => op,
-        };
-        self.e2(Mn::Mov, Op::dir(B_DIR), sop);
+        self.e2(Mn::Mov, Op::dir(B_DIR), op);
     }
 
     /// A = A op src
@@ -1247,8 +1252,8 @@ impl<'a> Gen<'a> {
                         let base_known = matches!(&self.st.dptr, Some(Dp::L(a, b)) if Some(a) == klo.as_ref() && Some(b) == khi.as_ref());
                         // DPTR may already hold base + something; handle simple increments.
                         if !base_known {
-                            let dlo = loc_dir(*llo, self.bank);
-                            let dhi = loc_dir(*lhi, self.bank);
+                            let dlo = self.mov_src_op(*llo);
+                            let dhi = self.mov_src_op(*lhi);
                             self.e2(Mn::Mov, Op::dir(DPL_DIR), dlo);
                             self.e2(Mn::Mov, Op::dir(DPH_DIR), dhi);
                             if let (Some(a), Some(b)) = (klo, khi) {
@@ -1561,7 +1566,7 @@ impl<'a> Gen<'a> {
         let tag = self.src(*p, 2);
         match (&lo, &hi) {
             (Src::L(a), Src::L(b)) => {
-                let (a, b) = (loc_dir(*a, self.bank), loc_dir(*b, self.bank));
+                let (a, b) = (self.mov_src_op(*a), self.mov_src_op(*b));
                 self.e2(Mn::Mov, Op::dir(DPL_DIR), a);
                 self.e2(Mn::Mov, Op::dir(DPH_DIR), b);
             }
@@ -1578,7 +1583,7 @@ impl<'a> Gen<'a> {
             self.e1(Mn::Inc, Op::Dptr);
         }
         let tagop = match tag {
-            Src::L(l) => loc_dir(l, self.bank),
+            Src::L(l) => self.mov_src_op(l),
             s => self.src_op(&s).unwrap(),
         };
         self.e2(Mn::Mov, Op::dir(B_DIR), tagop);
@@ -2926,7 +2931,7 @@ impl<'a> Gen<'a> {
     fn move_to_sfr(&mut self, addr: i64, s: &Src) {
         match s {
             Src::L(l) => {
-                let op = loc_dir(*l, self.bank);
+                let op = self.mov_src_op(*l);
                 self.e2(Mn::Mov, Op::dir(addr), op);
             }
             Src::Tree(_) | Src::Acc => {
