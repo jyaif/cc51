@@ -1561,3 +1561,16 @@ size_t __c16stombs(char *s, const char16_t *c16s, size_t n) {
   }
   return cnt;
 }
+
+/* ---- stdatomic.h ---- */
+
+#include <stdatomic.h>
+
+_Bool atomic_flag_test_and_set(volatile atomic_flag *object) {
+  _Bool r;
+  __critical {
+    r = object->flag;
+    object->flag = 1;
+  }
+  return r;
+}

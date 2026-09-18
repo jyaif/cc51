@@ -913,6 +913,9 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::new(ExprKind::Global(g), ty, loc));
                 }
                 match self.lookup(&name).cloned() {
+                    // A parameter of the prototype being parsed: only its type is known, which is
+                    // all a later parameter's array size can ask for.
+                    Some(Entry::ParamType(t)) => Ok(Expr::new(ExprKind::Int(0), t, loc)),
                     Some(Entry::Local(l)) => {
                         let ty = self.fctx.as_ref().unwrap().locals[l].ty.clone();
                         Ok(Expr::new(ExprKind::Local(l), ty, loc))
@@ -946,6 +949,7 @@ impl<'a> Parser<'a> {
                                 at: None,
                                 fattrs: FuncAttrs::default(),
                                 special: None,
+                                auto_type: false,
                             };
                             let fid = self.declare_func(name.clone(), Type::new(TypeKind::Func(Rc::new(ft))), &spec, loc, false)?;
                             let ty = self.prog.funcs[fid].ty.clone();
@@ -961,6 +965,8 @@ impl<'a> Parser<'a> {
                 let ty = self.type_name()?;
                 self.expect_p(",")?;
                 let mut off: u32 = 0;
+                // A subscript that is not constant is added at run time (SDCC).
+                let mut dyn_off: Option<Expr> = None;
                 let mut cur = ty;
                 loop {
                     let name = self.expect_ident()?;
@@ -977,10 +983,20 @@ impl<'a> Parser<'a> {
                     }
                     loop {
                         if self.eat_p("[") {
-                            let i = self.const_int_expr()?;
+                            let idx = self.assign()?;
                             self.expect_p("]")?;
                             let Some(e) = cur.pointee().cloned() else { return err(loc, "subscript of non-array in offsetof") };
-                            off += (i as u32) * self.prog.size(&e);
+                            let size = self.prog.size(&e);
+                            match self.eval_const(&idx) {
+                                Some(ConstVal::Int(i)) => off += (i as u32).wrapping_mul(size),
+                                _ => {
+                                    let scaled = self.scale_index(idx, size);
+                                    dyn_off = Some(match dyn_off.take() {
+                                        Some(d) => self.make_binary(BinOp::Add, d, scaled, loc)?,
+                                        None => scaled,
+                                    });
+                                }
+                            }
                             cur = e;
                         } else {
                             break;
@@ -991,7 +1007,14 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect_p(")")?;
-                Ok(Expr::int(off as i64, Type::uint(), loc))
+                let base = Expr::int(off as i64, Type::uint(), loc);
+                match dyn_off {
+                    Some(d) => {
+                        let e = self.make_binary(BinOp::Add, base, d, loc)?;
+                        Ok(self.conv(e, &Type::uint()))
+                    }
+                    None => Ok(base),
+                }
             }
             Tok::Kw(Kw::BuiltinVaArg) => {
                 self.expect_p("(")?;

@@ -17,6 +17,9 @@ use std::rc::Rc;
 #[derive(Clone, Debug)]
 enum Entry {
     Global(GlobalId),
+    /// A parameter of the prototype being parsed: only its type is available, for a later
+    /// parameter's array size (`void f(int n, char a[sizeof(n)])`).
+    ParamType(Type),
     Func(FuncId),
     Local(LocalId),
     Typedef(Type),
@@ -55,6 +58,8 @@ struct DeclSpec {
     fattrs: FuncAttrs,
     /// __sfr / __sbit declarations.
     special: Option<Space>,
+    /// C23 `auto x = e;`: the type comes from the initializer.
+    auto_type: bool,
 }
 
 struct SwitchCtx {
@@ -410,10 +415,18 @@ impl<'a> Parser<'a> {
                 return err(loc, format!("expected declaration but found {}", self.describe()));
             }
             diag::warn(loc, "type specifier missing, defaults to 'int'");
-            DeclSpec { ty: Type::int(), storage: Storage::None, inline: false, noreturn: false, at: None, fattrs: FuncAttrs::default(), special: None }
+            DeclSpec { ty: Type::int(), storage: Storage::None, inline: false, noreturn: false, at: None, fattrs: FuncAttrs::default(), special: None, auto_type: false }
         };
         if self.eat_p(";") {
             return Ok(());
+        }
+        let mut spec = spec;
+        if let Some(t) = self.auto_spec_type(&spec)? {
+            spec.ty = t;
+            spec.auto_type = false;
+            if spec.storage == Storage::Auto {
+                spec.storage = Storage::None;
+            }
         }
         let mut first = true;
         loop {
@@ -660,6 +673,7 @@ impl<'a> Parser<'a> {
         let mut special = None;
         // `_BitInt(N)` without signed/unsigned is signed, even where plain char is not.
         let mut bitint = false;
+        let mut saw_auto = false;
         #[derive(Default)]
         struct C {
             void: u8,
@@ -690,10 +704,18 @@ impl<'a> Parser<'a> {
                                 Kw::Auto => Storage::Auto,
                                 _ => Storage::Register,
                             };
-                            if storage != Storage::None && !(storage == s) {
-                                return err(self.loc(), "multiple storage classes in declaration specifiers");
+                            if s == Storage::Auto {
+                                // C23 also uses `auto` as a type specifier.
+                                saw_auto = true;
+                                if storage == Storage::None {
+                                    storage = s;
+                                }
+                            } else {
+                                if storage != Storage::None && storage != s && !(storage == Storage::Auto && saw_auto) {
+                                    return err(self.loc(), "multiple storage classes in declaration specifiers");
+                                }
+                                storage = s;
                             }
-                            storage = s;
                         }
                         Kw::ThreadLocal => {}
                         Kw::Inline => inline = true,
@@ -845,6 +867,7 @@ impl<'a> Parser<'a> {
         if signed && unsigned {
             return err(loc, "both 'signed' and 'unsigned' in declaration specifiers");
         }
+        let explicit_none = explicit.is_none();
         let base = if let Some(t) = explicit {
             if c.void + c.bool_ + c.bit + c.char_ + c.short + c.int + c.long + c.float + c.double + c.signed + c.unsigned > 0 {
                 return err(loc, "two or more data types in declaration specifiers");
@@ -874,6 +897,9 @@ impl<'a> Parser<'a> {
             Type::intk(IntKind::Long, !unsigned)
         } else if c.int > 0 || signed || unsigned {
             Type::intk(IntKind::Int, !unsigned)
+        } else if saw_auto {
+            // The type comes from the initializer.
+            Type::int()
         } else {
             if q == Quals::default() && storage == Storage::None && !inline && at.is_none() {
                 return err(loc, format!("expected type specifier but found {}", self.describe()));
@@ -881,6 +907,9 @@ impl<'a> Parser<'a> {
             diag::warn(loc, "type specifier missing, defaults to 'int'");
             Type::int()
         };
+        let auto_type = saw_auto
+            && explicit_none
+            && c.void + c.bool_ + c.bit + c.char_ + c.short + c.int + c.long + c.float + c.double + c.signed + c.unsigned == 0;
         let mut ty = base;
         // Merge qualifiers (typedef may already carry some).
         ty.q.is_const |= q.is_const;
@@ -891,7 +920,7 @@ impl<'a> Parser<'a> {
         if let Some(sp) = special {
             ty.q.space = Some(sp);
         }
-        Ok(DeclSpec { ty, storage, inline, noreturn, at, fattrs, special })
+        Ok(DeclSpec { ty, storage, inline, noreturn, at, fattrs, special, auto_type })
     }
 
     fn record_spec(&mut self, is_union: bool) -> Result<Type> {
@@ -1351,20 +1380,30 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         let mut names = Vec::new();
         let mut variadic = false;
-        loop {
-            if self.eat_p("...") {
-                variadic = true;
-                break;
+        // Earlier parameters are in scope for the declarators that follow.
+        self.push_scope();
+        let r = (|| -> Result<()> {
+            loop {
+                if self.eat_p("...") {
+                    variadic = true;
+                    break;
+                }
+                let spec = self.decl_spec()?;
+                let (mut ty, name, loc) = self.declarator(spec.ty.clone())?;
+                ty = self.adjust_param_type(ty);
+                if let Some(n) = &name {
+                    self.declare(n.clone(), Entry::ParamType(ty.clone()));
+                }
+                params.push(ty.clone());
+                names.push((name, ty, loc));
+                if !self.eat_p(",") {
+                    break;
+                }
             }
-            let spec = self.decl_spec()?;
-            let (mut ty, name, loc) = self.declarator(spec.ty.clone())?;
-            ty = self.adjust_param_type(ty);
-            params.push(ty.clone());
-            names.push((name, ty, loc));
-            if !self.eat_p(",") {
-                break;
-            }
-        }
+            Ok(())
+        })();
+        self.pop_scope();
+        r?;
         self.expect_p(")")?;
         Ok((params, names, variadic, false))
     }
@@ -1785,11 +1824,40 @@ impl<'a> Parser<'a> {
         ctx.locals.len() - 1
     }
 
+    /// C23 `auto x = e;`: the declared type is that of the initializer. Call it positioned on the
+    /// declarator; the position is left unchanged.
+    fn auto_spec_type(&mut self, spec: &DeclSpec) -> Result<Option<Type>> {
+        if !spec.auto_type {
+            return Ok(None);
+        }
+        if !matches!(self.peek(), Tok::Ident(_)) || !matches!(self.peek_at(1), Tok::Punct("=")) {
+            return Ok(None);
+        }
+        let save = self.pos;
+        self.pos += 2;
+        self.in_sizeof += 1;
+        let e = self.assign();
+        self.in_sizeof -= 1;
+        self.pos = save;
+        let e = self.rval(e?);
+        let mut t = e.ty.unqual();
+        t.q.space = None;
+        Ok(Some(t))
+    }
+
     /// Block-scope declaration. Returns statements for initializers.
     fn local_decl(&mut self, out: &mut Vec<Stmt>) -> Result<()> {
         let spec = self.decl_spec()?;
         if self.eat_p(";") {
             return Ok(());
+        }
+        let mut spec = spec;
+        if let Some(t) = self.auto_spec_type(&spec)? {
+            spec.ty = t;
+            spec.auto_type = false;
+            if spec.storage == Storage::Auto {
+                spec.storage = Storage::None;
+            }
         }
         loop {
             let (ty, name, loc, fattrs, _) = self.declarator_full(spec.ty.clone())?;
