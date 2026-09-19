@@ -11,7 +11,7 @@ same sources and the same board (`nfz330`, bytes of ROM):
 | example | SDCC | cc51 | |
 |---|---|---|---|
 | hello_world | 6130 | 4613 | 75% |
-| video_stream | 6405 | 5716 | 89% |
+| video_stream | 6405 | 4475 | 70% |
 | dino | 4005 | 2610 | 65% |
 | dino_game | 9064 | 5642 | 62% |
 
@@ -124,7 +124,7 @@ the compiler has to be pessimistic about what another file might do.
   folded through dead intermediates, runs of one constant loaded once through the accumulator,
   and `djnz` recognition.
 - Procedural abstraction: repeated instruction sequences are factored into shared subroutines as
-  long as the calls cost less than the duplication — 57 of them in the dino game.
+  long as the calls cost less than the duplication — 54 of them in the dino game.
 - Branch relaxation picks the shortest working form (`sjmp`/`ajmp`/`ljmp`, inverted conditional plus
   a jump where the target is out of reach), and absolute sections are placed without pushing
   relocatable code around.
