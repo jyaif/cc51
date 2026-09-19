@@ -5,7 +5,7 @@ dependencies. It reads the dialect SDCC accepts — address-space qualifiers, `_
 inline assembly — and stands in for `sdcc` in an existing build, but it compiles the whole program
 at once and optimizes hard for code size.
 
-On the [minitel-native](https://github.com/jyaif/minitel-native) examples, against SDCC 4.6 for the
+On the [minitel-native](https://github.com/fabio-d/minitel-native) examples, against SDCC 4.6 for the
 same sources and the same board (`nfz330`, bytes of ROM):
 
 | example | SDCC | cc51 | |
