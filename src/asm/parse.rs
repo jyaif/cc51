@@ -155,7 +155,15 @@ impl<'a> AsmParser<'a> {
         Ok(())
     }
 
+    /// SDCC local labels (00101$) are local to their asm block.
+    fn local_label(&self, name: &str) -> Option<String> {
+        (name.ends_with('$') && name.starts_with(|c: char| c.is_ascii_digit())).then(|| format!("{}${}", self.label_prefix, name))
+    }
+
     fn label_name(&self, name: &str) -> Rc<str> {
+        if let Some(l) = self.local_label(name) {
+            return l.into();
+        }
         match (self.resolve)(name) {
             Some(SymRes::Sym(s)) => s,
             _ => name.into(),
@@ -260,7 +268,14 @@ impl<'a> AsmParser<'a> {
     }
 
     pub fn expr_str(&mut self, s: &str) -> Result<Expr, String> {
-        let toks = tokenize(s)?;
+        let mut toks = tokenize(s)?;
+        for t in &mut toks {
+            if let T::Name(n) = t {
+                if let Some(l) = self.local_label(n) {
+                    *n = l;
+                }
+            }
+        }
         let mut p = ExprP { toks: &toks, pos: 0, parser: self };
         let e = p.expr(0)?;
         if p.pos != toks.len() {
