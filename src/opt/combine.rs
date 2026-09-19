@@ -819,9 +819,61 @@ pub fn run(f: &mut Func) -> bool {
             c |= narrow(f);
         }
         if !c {
+            c |= widening_mul(f);
+        }
+        if !c {
             break;
         }
         changed = true;
+    }
+    changed
+}
+
+/// `x` as a 16-bit operand of a widening multiply: the source of a 16-to-32-bit extension that is
+/// still valid at `at` (the multiply's result), or a constant; `Some(signed)` selects the kind.
+fn mul_operand16(f: &Func, inf: &Info, x: Val, at: VReg) -> Option<(Val, Option<bool>)> {
+    match x {
+        Val::K(k) => {
+            let k = Ty::I32.sext(k);
+            let signed = (-0x8000..0x8000).contains(&k);
+            let unsigned = (0..0x10000).contains(&k);
+            match (signed, unsigned) {
+                (true, true) => Some((Val::K(k & 0xffff), None)),
+                (true, false) => Some((Val::K(k & 0xffff), Some(true))),
+                (false, true) => Some((Val::K(k), Some(false))),
+                _ => None,
+            }
+        }
+        Val::R(r) => match inf.single_def(f, r)? {
+            Inst::Ext(_, src, signed) if matches!(src, Val::R(v) if f.ty(*v) == Ty::I16) && reg_stable(f, inf, *src, r) && reg_stable(f, inf, *src, at) => {
+                Some((*src, Some(*signed)))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A 32-bit product of two values extended from 16 bits becomes a 16x16->32 helper call.
+fn widening_mul(f: &mut Func) -> bool {
+    let inf = info(f);
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        for ii in 0..f.blocks[bi].insts.len() {
+            let Inst::Bin(BinK::Mul, d, a, b) = f.blocks[bi].insts[ii] else { continue };
+            if f.ty(d) != Ty::I32 || a.is_const() {
+                continue;
+            }
+            let (Some((xa, sa)), Some((xb, sb))) = (mul_operand16(f, &inf, a, d), mul_operand16(f, &inf, b, d)) else { continue };
+            let signed = match (sa, sb) {
+                (Some(x), Some(y)) if x == y => x,
+                (Some(x), None) | (None, Some(x)) => x,
+                _ => continue,
+            };
+            let name = if signed { "__mulsint32" } else { "__muluint32" };
+            f.blocks[bi].insts[ii] = Inst::Call(Some(d), Callee::Runtime(name), vec![xa, xb]);
+            changed = true;
+        }
     }
     changed
 }

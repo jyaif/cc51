@@ -93,6 +93,7 @@ fn helper_summary(name: &str) -> Summary {
     let r = |v: &[u8]| v.iter().map(|x| Loc::R(*x)).collect::<Vec<_>>();
     let (params, ret) = match name {
         "__mulint" | "__divuint" | "__divsint" | "__moduint" | "__modsint" => (vec![r(&[7, 6]), r(&[3, 2])], r(&[7, 6])),
+        "__mulsint32" | "__muluint32" => (vec![r(&[7, 6]), r(&[3, 2])], r(&[7, 6, 5, 4])),
         n if n.starts_with("__fs") && (n.ends_with("2sl") || n.ends_with("2ul")) => (vec![r(&[7, 6, 5, 4])], r(&[7, 6, 5, 4])),
         "__sl2fs" | "__ul2fs" => (vec![r(&[7, 6, 5, 4])], r(&[7, 6, 5, 4])),
         "__fseq" | "__fslt" => (vec![r(&[7, 6, 5, 4]), r(&[3, 2, 1, 0])], vec![ACC]),

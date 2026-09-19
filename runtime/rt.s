@@ -206,6 +206,74 @@ __abs_ab8_ret:
 	xch	a,b
 	ret
 
+;;; module mulint32
+; 16x16 -> 32 bit multiply: r7 (lo) / r6 (hi) * r3 / r2 -> r7..r4
+__mulsint32:
+	setb	F0
+	sjmp	__mulint32
+__muluint32:
+	clr	F0
+__mulint32:
+	mov	a,r7
+	mov	b,r3
+	mul	ab
+	mov	r0,a
+	mov	r1,b
+	mov	a,r6
+	mov	b,r3
+	mul	ab
+	add	a,r1
+	mov	r1,a
+	clr	a
+	addc	a,b
+	mov	r5,a
+	mov	a,r7
+	mov	b,r2
+	mul	ab
+	add	a,r1
+	mov	r1,a
+	mov	a,b
+	addc	a,r5
+	mov	r5,a
+	clr	a
+	rlc	a
+	mov	r4,a
+	mov	a,r6
+	mov	b,r2
+	mul	ab
+	add	a,r5
+	mov	r5,a
+	mov	a,b
+	addc	a,r4
+	mov	r4,a
+	jnb	F0,__mulint32_done
+	; signed: subtract the other operand from the high half for each negative operand
+	mov	a,r6
+	jnb	acc.7,__mulint32_b
+	clr	c
+	mov	a,r5
+	subb	a,r3
+	mov	r5,a
+	mov	a,r4
+	subb	a,r2
+	mov	r4,a
+__mulint32_b:
+	mov	a,r2
+	jnb	acc.7,__mulint32_done
+	clr	c
+	mov	a,r5
+	subb	a,r7
+	mov	r5,a
+	mov	a,r4
+	subb	a,r6
+	mov	r4,a
+__mulint32_done:
+	mov	a,r0
+	mov	r7,a
+	mov	a,r1
+	mov	r6,a
+	ret
+
 ;;; module mullong
 ; r7..r4 * r3..r0 -> r7..r4
 __mullong:
